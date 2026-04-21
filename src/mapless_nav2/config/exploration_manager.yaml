@@ -37,7 +37,7 @@ exploration_coordinator:
     decision_persistence_sec: 3.0
     optimistic_unknown_cost_scale: 0.45
 
-    maze_mode: True
+    maze_mode: False
     maze_cell_size_m: 0.40
     maze_search_depth_limit: 80
     maze_dead_end_penalty: 2.0

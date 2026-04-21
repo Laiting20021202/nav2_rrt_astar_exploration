@@ -457,7 +457,8 @@ class ExplorationCoordinator(Node):
         if transformed is None:
             src = msg.header.frame_id.strip() if msg.header.frame_id else "<empty>"
             self.get_logger().warn(
-                "Ignore goal: cannot transform frame '%s' into '%s'." % (src, self.global_frame)
+                "Ignore goal: cannot transform frame '%s' into '%s' for pose (%.2f, %.2f)."
+                % (src, self.global_frame, msg.pose.position.x, msg.pose.position.y)
             )
             return
         self.final_goal = transformed
@@ -480,7 +481,8 @@ class ExplorationCoordinator(Node):
         if transformed is None:
             src = msg.header.frame_id.strip() if msg.header.frame_id else "<empty>"
             self.get_logger().warn(
-                "Ignore clicked point: cannot transform frame '%s' into '%s'." % (src, self.global_frame)
+                "Ignore clicked point: cannot transform frame '%s' into '%s' for point (%.2f, %.2f)."
+                % (src, self.global_frame, msg.point.x, msg.point.y)
             )
             return
 
@@ -1192,6 +1194,18 @@ class ExplorationCoordinator(Node):
         goal_msg = NavigateToPose.Goal()
         goal_msg.pose = self.make_pose(target.pose_world[0], target.pose_world[1], target.pose_world[2])
 
+        self.get_logger().info(
+            "Dispatching target: type=%s id=%s pose=(%.2f, %.2f, %.2f) frame=%s"
+            % (
+                target.target_type,
+                target.target_id,
+                target.pose_world[0],
+                target.pose_world[1],
+                target.pose_world[2],
+                self.global_frame,
+            )
+        )
+
         self.current_goal_token += 1
         token = self.current_goal_token
         send_future = self.nav_client.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
@@ -1222,12 +1236,38 @@ class ExplorationCoordinator(Node):
 
         goal_handle = future.result()
         if goal_handle is None or not goal_handle.accepted:
-            self.get_logger().warn("Nav2 rejected target %s" % target.target_id)
+            self.get_logger().warn(
+                "Nav2 rejected target: type=%s id=%s pose=(%.2f, %.2f, %.2f) frame=%s"
+                % (
+                    target.target_type,
+                    target.target_id,
+                    target.pose_world[0],
+                    target.pose_world[1],
+                    target.pose_world[2],
+                    self.global_frame,
+                )
+            )
+            if self.active_target is not None:
+                self.get_logger().warn(
+                    "Active target at reject time: type=%s id=%s pose=(%.2f, %.2f, %.2f)"
+                    % (
+                        self.active_target.target_type,
+                        self.active_target.target_id,
+                        self.active_target.pose_world[0],
+                        self.active_target.pose_world[1],
+                        self.active_target.pose_world[2],
+                    )
+                )
             if target.frontier_id is not None:
                 self.register_frontier_failure(target.frontier_id, self.now_sec(), "goal_rejected")
+                self.memory.frontier_cooldown_until[target.frontier_id] = max(
+                    self.memory.frontier_cooldown_until.get(target.frontier_id, 0.0),
+                    self.now_sec() + max(self.replan_period_sec * 2.0, 5.0),
+                )
             self.active_goal_handle = None
             self.active_target = None
-            self.target_lock_until = self.now_sec()
+            self.last_plan_stamp = self.now_sec()
+            self.target_lock_until = self.now_sec() + self.replan_period_sec
             return
 
         self.active_goal_handle = goal_handle
@@ -1533,7 +1573,7 @@ class ExplorationCoordinator(Node):
         marker.id = 0
         marker.type = Marker.LINE_LIST
         marker.action = Marker.ADD
-        marker.scale.x = 0.01
+        marker.scale.x = 0.04
         marker.color.r = 0.0
         marker.color.g = 0.9
         marker.color.b = 1.0
