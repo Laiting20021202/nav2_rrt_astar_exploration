@@ -27,17 +27,17 @@ exploration_coordinator:
     free_threshold: 15
     occupied_threshold: 65
     inflation_radius_m: 0.14
-    dynamic_inflation_enabled: True
+    dynamic_inflation_enabled: False
     dynamic_inflation_goal_dist_m: 2.0
     dynamic_inflation_scale: 0.6
     dynamic_inflation_min_radius_m: 0.06
-    slim_inflation_fallback_enabled: True
+    slim_inflation_fallback_enabled: False
     goal_snap_radius_cells: 12
     astar_revisit_cost_scale: 0.06
-    decision_persistence_sec: 5.0
+    decision_persistence_sec: 1.0
     min_target_age_before_stuck_check_sec: 6.0
     reset_motion_history_on_new_target: True
-    optimistic_unknown_cost_scale: 0.45
+    optimistic_unknown_cost_scale: 0.0
 
     maze_mode: False
     maze_cell_size_m: 0.40
@@ -55,7 +55,7 @@ exploration_coordinator:
     frontier_filter_max_distance: 14.0
     max_scored_candidates: 24
 
-    recovery_cooldown_sec: 6.0
+    recovery_cooldown_sec: 1.5
     max_frontier_failures_total: 9999
 
     frontier_min_cluster_size: 3
@@ -77,12 +77,12 @@ exploration_coordinator:
     # Utility scoring weights
     w_info: 1.4
     w_cost: 1.15
-    w_visit: 0.7
-    w_fail: 1.0
-    w_turn: 0.35
-    w_goal: 0.5
-    w_commit: 0.45
-    w_clearance: 0.45
+    w_visit: 0.0
+    w_fail: 0.0
+    w_turn: 0.0
+    w_goal: 0.0
+    w_commit: 0.0
+    w_clearance: 0.0
     goal_gravity_range_m: 6.0
     goal_gravity_exp_gain: 1.2
     goal_gravity_max_multiplier: 3.5
@@ -93,21 +93,21 @@ exploration_coordinator:
     visited_increment: 1.0
     visited_prune_threshold: 0.03
 
-    frontier_cooldown_sec: 0.5
+    frontier_cooldown_sec: 0.0
     frontier_blacklist_base_sec: 1.0
-    frontier_blacklist_max_sec: 2.0
+    frontier_blacklist_max_sec: 1.0
     frontier_fail_blacklist_threshold: 999
 
-    commitment_horizon_sec: 10.0
+    commitment_horizon_sec: 0.0
 
-    stuck_window_sec: 20.0
+    stuck_window_sec: 60.0
     stuck_radius_m: 0.08
 
-    oscillation_window_sec: 10.0
+    oscillation_window_sec: 30.0
     oscillation_cell_size_m: 0.20
-    oscillation_toggle_threshold: 4
+    oscillation_toggle_threshold: 99
 
-    stagnation_window_sec: 45.0
+    stagnation_window_sec: 120.0
     stagnation_min_known_delta: 40
     stagnation_min_travel_m: 0.12
 

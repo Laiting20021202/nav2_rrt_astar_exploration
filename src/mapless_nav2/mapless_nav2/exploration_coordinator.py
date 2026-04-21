@@ -537,8 +537,6 @@ class ExplorationCoordinator(Node):
 
         self.memory.update_pose(robot_pose, now_sec, self.latest_known_count)
         self.memory.mark_cell_visited(robot_cell, now_sec, amount=0.25)
-        if self.maze_mode:
-            self.update_maze_memory(robot_cell, now_sec)
 
         dist_to_final_goal = float("inf")
         if self.final_goal is not None:
@@ -549,42 +547,6 @@ class ExplorationCoordinator(Node):
             if dist_to_final_goal <= self.goal_tolerance_m:
                 self.on_final_goal_reached()
                 return
-
-        if self.active_target is not None and self.active_target.target_type == "frontier":
-            target_age = max(0.0, now_sec - self.active_target_start_sec)
-            if target_age < self.min_target_age_before_stuck_check_sec:
-                self.get_logger().info(
-                    "Detector grace period active: target=%s age=%.2fs threshold=%.2fs skipped=True"
-                    % (
-                        self.active_target.target_id,
-                        target_age,
-                        self.min_target_age_before_stuck_check_sec,
-                    )
-                )
-            else:
-                self.get_logger().info(
-                    "Detector grace period expired: target=%s age=%.2fs threshold=%.2fs skipped=False"
-                    % (
-                        self.active_target.target_id,
-                        target_age,
-                        self.min_target_age_before_stuck_check_sec,
-                    )
-                )
-                stuck = self.memory.is_stuck(now_sec)
-                oscillating = self.memory.is_oscillating(now_sec)
-                stagnating = self.memory.is_stagnating(now_sec)
-                if stuck or oscillating or stagnating:
-                    reason = []
-                    if stuck:
-                        reason.append("stuck")
-                    if oscillating:
-                        reason.append("oscillation")
-                    if stagnating:
-                        reason.append("stagnation")
-                    self.register_frontier_failure(self.active_target.frontier_id, now_sec, "+".join(reason))
-                    self.trigger_recovery("detector=" + "+".join(reason), now_sec)
-                    self.publish_state("RECOVERY")
-                    return
 
         if now_sec < self.recovering_until:
             self.publish_state("RECOVERY")
@@ -619,8 +581,6 @@ class ExplorationCoordinator(Node):
         selected = self.select_frontier_target(robot_pose, robot_cell, now_sec, dist_to_final_goal)
         if selected is None:
             self.publish_state("NO_FRONTIER")
-            if self.final_goal is not None and self.memory.is_stagnating(now_sec):
-                self.trigger_recovery("no_frontier_and_stagnating", now_sec)
             return
 
         self.dispatch_target_if_needed(selected, now_sec)
@@ -635,11 +595,6 @@ class ExplorationCoordinator(Node):
     ) -> Optional[NavigationTarget]:
         if self.latest_map is None:
             return None
-
-        if self.maze_mode:
-            maze_target = self.select_maze_target(robot_pose, robot_cell, now_sec, dist_to_final_goal)
-            if maze_target is not None:
-                return maze_target
 
         clusters = self.extractor.extract_frontier_clusters(self.latest_map, self.latest_inflated_mask)
         self.publish_frontier_markers(clusters)
@@ -660,54 +615,43 @@ class ExplorationCoordinator(Node):
         self.publish_rrt_tree(tree_edges)
 
         if not candidates:
+            fallback_scored = self.score_frontier_boundary_fallback(
+                clusters,
+                robot_pose,
+                robot_cell,
+                final_goal_xy=None if self.final_goal is None else (
+                    self.final_goal.pose.position.x,
+                    self.final_goal.pose.position.y,
+                ),
+                now_sec=now_sec,
+                dist_to_final_goal=dist_to_final_goal,
+            )
+            if fallback_scored:
+                self.publish_candidate_markers(fallback_scored)
+                best = fallback_scored[0]
+                target_yaw = self.compute_target_yaw(robot_pose, best.world)
+                return NavigationTarget(
+                    target_type="frontier",
+                    target_id=best.candidate_id,
+                    frontier_id=best.frontier_id,
+                    candidate_id=best.candidate_id,
+                    pose_world=(best.world[0], best.world[1], target_yaw),
+                    path_cells=best.path_cells,
+                )
             self.get_logger().warn(
-                "No frontier candidates generated. maze_mode=%s memory=%s"
-                % (str(self.maze_mode), self.frontier_memory_summary(now_sec))
+                "No frontier candidates generated. memory=%s" % self.frontier_memory_summary(now_sec)
             )
             self.clear_candidate_markers()
             return None
-
-        # Respect commitment horizon if active frontier remains reachable.
-        if self.active_target is not None and self.active_target.frontier_id is not None:
-            af = self.active_target.frontier_id
-            if self.memory.commitment_active(af, now_sec):
-                for cand in candidates:
-                    if cand.frontier_id != af:
-                        continue
-                    path_cells, path_cost = self.plan_on_known_free(
-                        robot_cell,
-                        cand.cell,
-                        dist_to_goal_m=dist_to_final_goal,
-                    )
-                    if path_cells:
-                        cand.path_cells = path_cells
-                        cand.path_cost = path_cost
-                        target_yaw = self.compute_target_yaw(robot_pose, cand.world)
-                        return NavigationTarget(
-                            target_type="frontier",
-                            target_id=cand.candidate_id,
-                            frontier_id=cand.frontier_id,
-                            candidate_id=cand.candidate_id,
-                            pose_world=(cand.world[0], cand.world[1], target_yaw),
-                            path_cells=path_cells,
-                        )
 
         final_goal_xy = None
         if self.final_goal is not None:
             final_goal_xy = (self.final_goal.pose.position.x, self.final_goal.pose.position.y)
 
         scored: List[FrontierCandidate] = []
-        available_count = 0
+        available_count = len(candidates)
         path_ok_count = 0
         for cand in candidates:
-            if not self.memory.frontier_available(cand.frontier_id, now_sec):
-                self.get_logger().info(
-                    "Candidate filtered by frontier memory: frontier_id=%s reason=%s"
-                    % (cand.frontier_id, self.frontier_block_reason(cand.frontier_id, now_sec))
-                )
-                continue
-            available_count += 1
-
             path_cells, path_cost = self.plan_on_known_free(
                 robot_cell,
                 cand.cell,
@@ -719,11 +663,6 @@ class ExplorationCoordinator(Node):
 
             cand.path_cells = path_cells
             cand.path_cost = path_cost
-            cand.revisit_penalty = self.memory.revisit_penalty(cand.cell, now_sec)
-            cand.failed_penalty = self.memory.frontier_failed_penalty(cand.frontier_id, now_sec)
-            cand.heading_penalty = self.scorer.heading_change_penalty(robot_pose, cand.world)
-            cand.goal_alignment_bonus = self.scorer.goal_alignment_bonus(robot_pose, cand.world, final_goal_xy)
-            cand.commitment_bonus = self.memory.commitment_bonus(cand.frontier_id, now_sec)
             scored.append(cand)
 
         self.get_logger().info(
@@ -753,12 +692,11 @@ class ExplorationCoordinator(Node):
                     path_cells=best.path_cells,
                 )
             self.get_logger().warn(
-                "No scored frontier candidate: total=%d available=%d path_ok=%d maze_mode=%s memory=%s"
+                "No scored frontier candidate: total=%d available=%d path_ok=%d memory=%s"
                 % (
                     len(candidates),
                     available_count,
                     path_ok_count,
-                    str(self.maze_mode),
                     self.frontier_memory_summary(now_sec),
                 )
             )
@@ -766,7 +704,6 @@ class ExplorationCoordinator(Node):
             return None
 
         scored = self.scorer.score_candidates(scored, robot_pose, final_goal_xy, self.memory, now_sec)
-        scored = self.learned_ranker.rerank(scored)
         scored = scored[: max(1, self.max_scored_candidates)]
         self.publish_candidate_markers(scored)
 
@@ -1023,8 +960,6 @@ class ExplorationCoordinator(Node):
         min_dist = max(0.2, 0.5 * self.frontier_filter_min_distance)
 
         for cluster in clusters:
-            if not self.memory.frontier_available(cluster.cluster_id, now_sec):
-                continue
             boundary = list(cluster.boundary_cells)
             if not boundary:
                 continue
@@ -1068,19 +1003,12 @@ class ExplorationCoordinator(Node):
                 )
                 cand.path_cells = path_cells
                 cand.path_cost = path_cost
-                cand.revisit_penalty = self.memory.revisit_penalty(cand.cell, now_sec)
-                cand.failed_penalty = self.memory.frontier_failed_penalty(cand.frontier_id, now_sec)
-                cand.heading_penalty = self.scorer.heading_change_penalty(robot_pose, cand.world)
-                cand.goal_alignment_bonus = self.scorer.goal_alignment_bonus(robot_pose, cand.world, final_goal_xy)
-                cand.commitment_bonus = self.memory.commitment_bonus(cand.frontier_id, now_sec)
-                cand.clearance_bonus = self.extractor.estimate_clearance(self.latest_map, cand.cell)
                 scored.append(cand)
                 accepted += 1
 
         if not scored:
             return []
         scored = self.scorer.score_candidates(scored, robot_pose, final_goal_xy, self.memory, now_sec)
-        scored = self.learned_ranker.rerank(scored)
         scored = scored[: max(1, self.max_scored_candidates)]
         self.get_logger().info("Using boundary fallback candidates: %d" % len(scored))
         return scored
@@ -1400,8 +1328,6 @@ class ExplorationCoordinator(Node):
         req = ClearEntireCostmap.Request()
         if self.clear_local_client.service_is_ready():
             self.clear_local_client.call_async(req)
-        if self.clear_global_client.service_is_ready():
-            self.clear_global_client.call_async(req)
 
         self.recovering_until = now_sec + self.recovery_cooldown_sec
         self.active_target_start_sec = now_sec
