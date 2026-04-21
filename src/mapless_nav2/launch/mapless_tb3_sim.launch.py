@@ -212,10 +212,14 @@ def generate_launch_description() -> LaunchDescription:
                 "tilt_status_topic": "/scan_tilt_exceeded",
                 "global_frame": "odom",
                 "base_frame": "base_footprint",
+                "odom_topic": "/odom",
                 "max_roll_deg": 7.0,
                 "max_pitch_deg": 7.0,
                 "hard_stop_deg": 12.0,
                 "hysteresis_deg": 1.0,
+                "max_yaw_rate_deg_s": 22.0,
+                "max_yaw_delta_per_scan_deg": 2.5,
+                "drop_scan_on_fast_turn": True,
             }
         ],
     )

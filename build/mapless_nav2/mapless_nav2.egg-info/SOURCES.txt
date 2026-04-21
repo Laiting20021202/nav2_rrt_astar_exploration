@@ -1,13 +1,6 @@
 package.xml
 setup.cfg
 setup.py
-../../build/mapless_nav2/mapless_nav2.egg-info/PKG-INFO
-../../build/mapless_nav2/mapless_nav2.egg-info/SOURCES.txt
-../../build/mapless_nav2/mapless_nav2.egg-info/dependency_links.txt
-../../build/mapless_nav2/mapless_nav2.egg-info/entry_points.txt
-../../build/mapless_nav2/mapless_nav2.egg-info/requires.txt
-../../build/mapless_nav2/mapless_nav2.egg-info/top_level.txt
-../../build/mapless_nav2/mapless_nav2.egg-info/zip-safe
 behavior_trees/explore_goal_switch_nav.xml
 config/exploration_manager.yaml
 config/nav2_frontier_exploration_params.yaml

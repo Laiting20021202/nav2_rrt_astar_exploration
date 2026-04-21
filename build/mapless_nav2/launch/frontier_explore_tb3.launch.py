@@ -1,1 +1,1 @@
-/home/david/Desktop/laiting/navigation/src/mapless_nav2/launch/frontier_explore_tb3.launch.py
+/home/david/Desktop/laiting/navigation_codex_legacy_baseline/src/mapless_nav2/launch/frontier_explore_tb3.launch.py

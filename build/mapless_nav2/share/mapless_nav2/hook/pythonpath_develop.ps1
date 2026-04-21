@@ -1,3 +1,3 @@
 # generated from colcon_powershell/shell/template/hook_prepend_value.ps1.em
 
-colcon_prepend_unique_value PYTHONPATH "$env:COLCON_CURRENT_PREFIX\/home/david/Desktop/laiting/navigation/build/mapless_nav2"
+colcon_prepend_unique_value PYTHONPATH "$env:COLCON_CURRENT_PREFIX\/home/david/Desktop/laiting/navigation_codex_legacy_baseline/build/mapless_nav2"
