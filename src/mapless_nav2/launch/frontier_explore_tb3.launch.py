@@ -155,6 +155,25 @@ def generate_launch_description() -> LaunchDescription:
         }.items(),
     )
 
+    nav2_bringup_log_cmd = LogInfo(
+        msg=[
+            "[mapless_nav2] Starting Nav2 bringup with autostart=",
+            autostart,
+            " params_file=",
+            params_file,
+            " use_composition=",
+            use_composition,
+        ]
+    )
+
+    nav2_lifecycle_hint_log_cmd = LogInfo(
+        msg=(
+            "[mapless_nav2] Watch bt_navigator / planner_server / controller_server / "
+            "behavior_server / lifecycle_manager_navigation logs during startup. "
+            "If Navigation stays inactive, one of these nodes failed configure/activate."
+        )
+    )
+
     scan_stabilizer_cmd = Node(
         condition=IfCondition(use_scan_stabilizer),
         package="mapless_nav2",
@@ -214,6 +233,8 @@ def generate_launch_description() -> LaunchDescription:
     ld.add_action(gazebo_spawner_cmd)
     ld.add_action(scan_stabilizer_cmd)
     ld.add_action(slam_toolbox_cmd)
+    ld.add_action(nav2_bringup_log_cmd)
+    ld.add_action(nav2_lifecycle_hint_log_cmd)
     ld.add_action(nav2_navigation_cmd)
     ld.add_action(exploration_coordinator_cmd)
     ld.add_action(rviz_cmd)

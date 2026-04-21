@@ -1256,7 +1256,7 @@ class ExplorationCoordinator(Node):
         goal_handle = future.result()
         if goal_handle is None or not goal_handle.accepted:
             self.get_logger().warn(
-                "Nav2 rejected target: type=%s id=%s pose=(%.2f, %.2f, %.2f) frame=%s"
+                "Nav2 rejected target: type=%s id=%s pose=(%.2f, %.2f, %.2f) frame=%s stamp=%.3f"
                 % (
                     target.target_type,
                     target.target_id,
@@ -1264,17 +1264,20 @@ class ExplorationCoordinator(Node):
                     target.pose_world[1],
                     target.pose_world[2],
                     self.global_frame,
+                    self.now_sec(),
                 )
             )
             if self.active_target is not None:
                 self.get_logger().warn(
-                    "Active target at reject time: type=%s id=%s pose=(%.2f, %.2f, %.2f)"
+                    "Current nav target at reject time: type=%s id=%s pose=(%.2f, %.2f, %.2f) frame=%s stamp=%.3f"
                     % (
                         self.active_target.target_type,
                         self.active_target.target_id,
                         self.active_target.pose_world[0],
                         self.active_target.pose_world[1],
                         self.active_target.pose_world[2],
+                        self.global_frame,
+                        self.now_sec(),
                     )
                 )
             if target.frontier_id is not None:
