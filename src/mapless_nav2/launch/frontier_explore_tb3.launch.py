@@ -29,8 +29,8 @@ def generate_launch_description() -> LaunchDescription:
     slam_params = os.path.join(pkg_mapless, "config", "slam_toolbox_online_async.yaml")
     rviz_default = os.path.join(pkg_mapless, "rviz", "frontier_explore.rviz")
     world_default = os.path.join(local_tb3_gazebo, "worlds", "turtlebot3_house.world")
-    robot_sdf_default = os.path.join(pkg_mapless, "models", "turtlebot3_waffle_45deg", "model.sdf")
-    urdf_default = os.path.join(local_tb3_gazebo, "urdf", "turtlebot3_waffle.urdf")
+    robot_sdf_default = os.path.join(local_tb3_gazebo, "models", "turtlebot3_burger", "model.sdf")
+    urdf_default = os.path.join(local_tb3_gazebo, "urdf", "turtlebot3_burger.urdf")
 
     with open(urdf_default, "r", encoding="utf-8") as f:
         robot_description = f.read()
@@ -77,11 +77,11 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("y_pose", default_value="-0.5"),
         DeclareLaunchArgument("z_pose", default_value="0.01"),
         DeclareLaunchArgument("yaw", default_value="0.0"),
-        DeclareLaunchArgument("robot_name", default_value="turtlebot3_waffle"),
+        DeclareLaunchArgument("robot_name", default_value="turtlebot3_burger"),
         DeclareLaunchArgument("robot_sdf", default_value=robot_sdf_default),
     ]
 
-    set_tb3_model_env = SetEnvironmentVariable(name="TURTLEBOT3_MODEL", value="waffle")
+    set_tb3_model_env = SetEnvironmentVariable(name="TURTLEBOT3_MODEL", value="burger")
     set_gazebo_model_path_env = SetEnvironmentVariable(
         name="GAZEBO_MODEL_PATH",
         value=[tb3_models_path, ":", EnvironmentVariable("GAZEBO_MODEL_PATH", default_value="")],
