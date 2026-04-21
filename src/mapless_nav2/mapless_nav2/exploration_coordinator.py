@@ -103,6 +103,8 @@ class ExplorationCoordinator(Node):
         self.declare_parameter("goal_snap_radius_cells", 12)
         self.declare_parameter("astar_revisit_cost_scale", 0.06)
         self.declare_parameter("decision_persistence_sec", 3.0)
+        self.declare_parameter("min_target_age_before_stuck_check_sec", 6.0)
+        self.declare_parameter("reset_motion_history_on_new_target", True)
         self.declare_parameter("optimistic_unknown_cost_scale", 0.45)
 
         self.declare_parameter("maze_mode", True)
@@ -210,6 +212,12 @@ class ExplorationCoordinator(Node):
         self.goal_snap_radius_cells = int(self.get_parameter("goal_snap_radius_cells").value)
         self.astar_revisit_cost_scale = float(self.get_parameter("astar_revisit_cost_scale").value)
         self.decision_persistence_sec = float(self.get_parameter("decision_persistence_sec").value)
+        self.min_target_age_before_stuck_check_sec = float(
+            self.get_parameter("min_target_age_before_stuck_check_sec").value
+        )
+        self.reset_motion_history_on_new_target = bool(
+            self.get_parameter("reset_motion_history_on_new_target").value
+        )
         self.optimistic_unknown_cost_scale = float(self.get_parameter("optimistic_unknown_cost_scale").value)
 
         self.maze_mode = bool(self.get_parameter("maze_mode").value)
@@ -366,6 +374,7 @@ class ExplorationCoordinator(Node):
         self.last_feedback_remaining = float("inf")
         self.total_frontier_failures = 0
         self.target_lock_until = 0.0
+        self.active_target_start_sec = 0.0
 
         self.get_logger().info("ExplorationCoordinator started. frontier memory + scoring + Nav2 switching active.")
 
@@ -542,21 +551,40 @@ class ExplorationCoordinator(Node):
                 return
 
         if self.active_target is not None and self.active_target.target_type == "frontier":
-            stuck = self.memory.is_stuck(now_sec)
-            oscillating = self.memory.is_oscillating(now_sec)
-            stagnating = self.memory.is_stagnating(now_sec)
-            if stuck or oscillating or stagnating:
-                reason = []
-                if stuck:
-                    reason.append("stuck")
-                if oscillating:
-                    reason.append("oscillation")
-                if stagnating:
-                    reason.append("stagnation")
-                self.register_frontier_failure(self.active_target.frontier_id, now_sec, "+".join(reason))
-                self.trigger_recovery("detector=" + "+".join(reason), now_sec)
-                self.publish_state("RECOVERY")
-                return
+            target_age = max(0.0, now_sec - self.active_target_start_sec)
+            if target_age < self.min_target_age_before_stuck_check_sec:
+                self.get_logger().info(
+                    "Detector grace period active: target=%s age=%.2fs threshold=%.2fs skipped=True"
+                    % (
+                        self.active_target.target_id,
+                        target_age,
+                        self.min_target_age_before_stuck_check_sec,
+                    )
+                )
+            else:
+                self.get_logger().info(
+                    "Detector grace period expired: target=%s age=%.2fs threshold=%.2fs skipped=False"
+                    % (
+                        self.active_target.target_id,
+                        target_age,
+                        self.min_target_age_before_stuck_check_sec,
+                    )
+                )
+                stuck = self.memory.is_stuck(now_sec)
+                oscillating = self.memory.is_oscillating(now_sec)
+                stagnating = self.memory.is_stagnating(now_sec)
+                if stuck or oscillating or stagnating:
+                    reason = []
+                    if stuck:
+                        reason.append("stuck")
+                    if oscillating:
+                        reason.append("oscillation")
+                    if stagnating:
+                        reason.append("stagnation")
+                    self.register_frontier_failure(self.active_target.frontier_id, now_sec, "+".join(reason))
+                    self.trigger_recovery("detector=" + "+".join(reason), now_sec)
+                    self.publish_state("RECOVERY")
+                    return
 
         if now_sec < self.recovering_until:
             self.publish_state("RECOVERY")
@@ -1231,8 +1259,13 @@ class ExplorationCoordinator(Node):
         send_future.add_done_callback(lambda fut, t=token, tar=target: self.goal_response_callback(fut, t, tar))
 
         self.active_target = target
+        self.active_target_start_sec = now_sec
         self.last_plan_stamp = now_sec
         self.target_lock_until = now_sec + max(0.0, self.decision_persistence_sec)
+        if self.reset_motion_history_on_new_target:
+            robot_pose = self.get_robot_pose()
+            if robot_pose is not None:
+                self.memory.reset_for_new_target(robot_pose, now_sec, self.latest_known_count)
         if target.frontier_id is not None:
             self.memory.register_frontier_selected(target.frontier_id, now_sec)
 
@@ -1288,6 +1321,7 @@ class ExplorationCoordinator(Node):
                 )
             self.active_goal_handle = None
             self.active_target = None
+            self.active_target_start_sec = 0.0
             self.last_plan_stamp = self.now_sec()
             self.target_lock_until = self.now_sec() + self.replan_period_sec
             return
@@ -1327,6 +1361,7 @@ class ExplorationCoordinator(Node):
                 self.memory.register_frontier_success(target.frontier_id)
                 self.memory.mark_path_visited(target.path_cells, now_sec)
             self.active_target = None
+            self.active_target_start_sec = 0.0
             self.target_lock_until = now_sec
             self.last_plan_stamp = 0.0
             self.mode = "EXPLORING"
@@ -1341,6 +1376,7 @@ class ExplorationCoordinator(Node):
             self.trigger_recovery("final_goal_nav_failed", now_sec)
 
         self.active_target = None
+        self.active_target_start_sec = 0.0
         self.target_lock_until = now_sec
 
     def register_frontier_failure(self, frontier_id: Optional[str], now_sec: float, reason: str) -> None:
@@ -1368,6 +1404,10 @@ class ExplorationCoordinator(Node):
             self.clear_global_client.call_async(req)
 
         self.recovering_until = now_sec + self.recovery_cooldown_sec
+        self.active_target_start_sec = now_sec
+        robot_pose = self.get_robot_pose()
+        if robot_pose is not None:
+            self.memory.reset_for_new_target(robot_pose, now_sec, self.latest_known_count)
         self.mode = "RECOVERY"
         self.get_logger().warn("Recovery triggered: %s" % reason)
 
@@ -1384,6 +1424,7 @@ class ExplorationCoordinator(Node):
     def on_final_goal_reached(self) -> None:
         self.cancel_active_navigation()
         self.active_target = None
+        self.active_target_start_sec = 0.0
         self.target_lock_until = self.now_sec()
         self.final_goal = None
         self.final_goal_reachable_cache = False

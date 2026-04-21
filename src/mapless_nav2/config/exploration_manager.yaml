@@ -22,7 +22,7 @@ exploration_coordinator:
     replan_period_sec: 2.0
     goal_reachability_recheck_sec: 2.0
     goal_tolerance_m: 0.35
-    progress_min_delta_m: 0.12
+    progress_min_delta_m: 0.04
 
     free_threshold: 15
     occupied_threshold: 65
@@ -34,7 +34,9 @@ exploration_coordinator:
     slim_inflation_fallback_enabled: True
     goal_snap_radius_cells: 12
     astar_revisit_cost_scale: 0.06
-    decision_persistence_sec: 0.5
+    decision_persistence_sec: 5.0
+    min_target_age_before_stuck_check_sec: 6.0
+    reset_motion_history_on_new_target: True
     optimistic_unknown_cost_scale: 0.45
 
     maze_mode: False
@@ -53,7 +55,7 @@ exploration_coordinator:
     frontier_filter_max_distance: 14.0
     max_scored_candidates: 24
 
-    recovery_cooldown_sec: 3.0
+    recovery_cooldown_sec: 6.0
     max_frontier_failures_total: 9999
 
     frontier_min_cluster_size: 3
@@ -98,16 +100,16 @@ exploration_coordinator:
 
     commitment_horizon_sec: 10.0
 
-    stuck_window_sec: 12.0
-    stuck_radius_m: 0.22
+    stuck_window_sec: 20.0
+    stuck_radius_m: 0.08
 
     oscillation_window_sec: 10.0
     oscillation_cell_size_m: 0.20
     oscillation_toggle_threshold: 4
 
-    stagnation_window_sec: 20.0
+    stagnation_window_sec: 45.0
     stagnation_min_known_delta: 40
-    stagnation_min_travel_m: 0.60
+    stagnation_min_travel_m: 0.12
 
     # Optional learned reranker (disabled baseline)
     learned_ranker_enabled: False
