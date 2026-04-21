@@ -3,6 +3,7 @@ import copy
 import math
 from typing import Optional, Tuple
 
+from nav_msgs.msg import Odometry
 import rclpy
 from rclpy.duration import Duration
 from rclpy.executors import ExternalShutdownException
@@ -35,6 +36,7 @@ class ScanStabilizer(Node):
 
         self.declare_parameter("input_scan_topic", "/scan")
         self.declare_parameter("output_scan_topic", "/scan_stable")
+        self.declare_parameter("odom_topic", "/odom")
         self.declare_parameter("tilt_status_topic", "/scan_tilt_exceeded")
         self.declare_parameter("global_frame", "odom")
         self.declare_parameter("base_frame", "base_footprint")
@@ -42,12 +44,16 @@ class ScanStabilizer(Node):
         self.declare_parameter("max_roll_deg", 7.0)
         self.declare_parameter("max_pitch_deg", 7.0)
         self.declare_parameter("hard_stop_deg", 12.0)
+        self.declare_parameter("max_yaw_rate_deg_s", 55.0)
+        self.declare_parameter("max_yaw_delta_per_scan_deg", 8.0)
+        self.declare_parameter("drop_scan_on_fast_turn", True)
         self.declare_parameter("hysteresis_deg", 1.0)
         self.declare_parameter("tf_timeout_sec", 0.05)
         self.declare_parameter("warn_interval_sec", 2.0)
 
         self.input_scan_topic = str(self.get_parameter("input_scan_topic").value)
         self.output_scan_topic = str(self.get_parameter("output_scan_topic").value)
+        self.odom_topic = str(self.get_parameter("odom_topic").value)
         self.tilt_status_topic = str(self.get_parameter("tilt_status_topic").value)
         self.global_frame = str(self.get_parameter("global_frame").value)
         self.base_frame = str(self.get_parameter("base_frame").value)
@@ -55,6 +61,9 @@ class ScanStabilizer(Node):
         self.max_roll = math.radians(float(self.get_parameter("max_roll_deg").value))
         self.max_pitch = math.radians(float(self.get_parameter("max_pitch_deg").value))
         self.hard_stop = math.radians(float(self.get_parameter("hard_stop_deg").value))
+        self.max_yaw_rate = math.radians(float(self.get_parameter("max_yaw_rate_deg_s").value))
+        self.max_yaw_delta_per_scan = math.radians(float(self.get_parameter("max_yaw_delta_per_scan_deg").value))
+        self.drop_scan_on_fast_turn = bool(self.get_parameter("drop_scan_on_fast_turn").value)
         self.hysteresis = math.radians(float(self.get_parameter("hysteresis_deg").value))
         self.tf_timeout_sec = float(self.get_parameter("tf_timeout_sec").value)
         self.warn_interval_sec = float(self.get_parameter("warn_interval_sec").value)
@@ -63,71 +72,92 @@ class ScanStabilizer(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.scan_sub = self.create_subscription(LaserScan, self.input_scan_topic, self.scan_callback, 10)
+        self.odom_sub = self.create_subscription(Odometry, self.odom_topic, self.odom_callback, 20)
         self.scan_pub = self.create_publisher(LaserScan, self.output_scan_topic, 10)
         self.tilt_status_pub = self.create_publisher(Bool, self.tilt_status_topic, 10)
 
         self.tilt_blocked = False
+        self.latest_yaw_rate = 0.0
         self.last_warn_sec = 0.0
 
         self.get_logger().info(
-            "Scan stabilizer enabled: in=%s out=%s max_roll=%.1fdeg max_pitch=%.1fdeg"
+            "Scan stabilizer enabled: in=%s out=%s max_roll=%.1fdeg max_pitch=%.1fdeg max_yaw_rate=%.1fdeg/s"
             % (
                 self.input_scan_topic,
                 self.output_scan_topic,
                 math.degrees(self.max_roll),
                 math.degrees(self.max_pitch),
+                math.degrees(self.max_yaw_rate),
             )
         )
 
     def now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
 
+    def odom_callback(self, msg: Odometry) -> None:
+        self.latest_yaw_rate = float(msg.twist.twist.angular.z)
+
     def scan_callback(self, msg: LaserScan) -> None:
         tilt = self.lookup_tilt()
-        if tilt is None:
-            # If TF is temporarily unavailable, do not drop scan data.
-            self.scan_pub.publish(msg)
-            self.tilt_status_pub.publish(Bool(data=False))
-            return
+        roll = 0.0
+        pitch = 0.0
+        tilt_blocked = False
 
-        roll, pitch = tilt
-        abs_roll = abs(roll)
-        abs_pitch = abs(pitch)
-        max_tilt = max(abs_roll, abs_pitch)
-        soft_limit = max(self.max_roll, self.max_pitch)
+        if tilt is not None:
+            roll, pitch = tilt
+            abs_roll = abs(roll)
+            abs_pitch = abs(pitch)
+            max_tilt = max(abs_roll, abs_pitch)
 
-        if self.tilt_blocked:
-            # Hysteresis to avoid rapid toggling near threshold.
-            if abs_roll <= max(0.0, self.max_roll - self.hysteresis) and abs_pitch <= max(0.0, self.max_pitch - self.hysteresis):
-                self.tilt_blocked = False
-        else:
-            if abs_roll > self.max_roll or abs_pitch > self.max_pitch:
+            if self.tilt_blocked:
+                if abs_roll <= max(0.0, self.max_roll - self.hysteresis) and abs_pitch <= max(0.0, self.max_pitch - self.hysteresis):
+                    self.tilt_blocked = False
+            else:
+                if abs_roll > self.max_roll or abs_pitch > self.max_pitch:
+                    self.tilt_blocked = True
+
+            if max_tilt >= self.hard_stop:
                 self.tilt_blocked = True
+            tilt_blocked = self.tilt_blocked
 
-        if max_tilt >= self.hard_stop:
-            self.tilt_blocked = True
+        scan_duration = self.compute_scan_duration(msg)
+        yaw_delta = abs(self.latest_yaw_rate) * scan_duration
+        fast_turn_blocked = bool(
+            self.drop_scan_on_fast_turn
+            and (
+                abs(self.latest_yaw_rate) > self.max_yaw_rate
+                or yaw_delta > self.max_yaw_delta_per_scan
+            )
+        )
 
-        if self.tilt_blocked:
+        if tilt_blocked or fast_turn_blocked:
             out = copy.copy(msg)
             out.ranges = [float("inf")] * len(msg.ranges)
             if msg.intensities:
                 out.intensities = [0.0] * len(msg.intensities)
             self.scan_pub.publish(out)
             self.tilt_status_pub.publish(Bool(data=True))
-            self.maybe_warn(roll, pitch)
+            self.maybe_warn(roll, pitch, math.degrees(self.latest_yaw_rate), math.degrees(yaw_delta))
             return
 
         self.scan_pub.publish(msg)
         self.tilt_status_pub.publish(Bool(data=False))
 
-    def maybe_warn(self, roll: float, pitch: float) -> None:
+    def compute_scan_duration(self, msg: LaserScan) -> float:
+        if msg.time_increment > 0.0 and msg.ranges:
+            return float(msg.time_increment) * float(len(msg.ranges))
+        if msg.scan_time > 0.0:
+            return float(msg.scan_time)
+        return 0.0
+
+    def maybe_warn(self, roll: float, pitch: float, yaw_rate_deg_s: float, yaw_delta_deg: float) -> None:
         now_sec = self.now_sec()
         if now_sec - self.last_warn_sec < self.warn_interval_sec:
             return
         self.last_warn_sec = now_sec
         self.get_logger().warn(
-            "Tilt exceeded, suppressing scan: roll=%.1fdeg pitch=%.1fdeg"
-            % (math.degrees(roll), math.degrees(pitch))
+            "Suppressing scan: roll=%.1fdeg pitch=%.1fdeg yaw_rate=%.1fdeg/s yaw_delta=%.1fdeg"
+            % (math.degrees(roll), math.degrees(pitch), yaw_rate_deg_s, yaw_delta_deg)
         )
 
     def lookup_tilt(self) -> Optional[Tuple[float, float]]:
@@ -161,4 +191,3 @@ def main(args=None) -> None:
 
 if __name__ == "__main__":
     main()
-

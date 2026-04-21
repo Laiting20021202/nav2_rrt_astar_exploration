@@ -34,9 +34,7 @@ setup(
         ),
         (
             f"share/{package_name}/behavior_trees",
-            [
-                "behavior_trees/explore_goal_switch_nav.xml",
-            ],
+            ["behavior_trees/explore_goal_switch_nav.xml"],
         ),
         (
             f"share/{package_name}/models/turtlebot3_waffle_45deg",

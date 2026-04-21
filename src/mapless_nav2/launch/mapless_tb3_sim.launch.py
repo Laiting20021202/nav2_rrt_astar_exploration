@@ -33,8 +33,8 @@ def generate_launch_description() -> LaunchDescription:
     params_default = os.path.join(pkg_mapless, "config", "nav2_mapless_params.yaml")
     rviz_default = os.path.join(pkg_mapless, "rviz", "mapless_nav2.rviz")
     world_default = os.path.join(local_tb3_gazebo, "worlds", "turtlebot3_house.world")
-    robot_sdf_default = os.path.join(pkg_mapless, "models", "turtlebot3_waffle_45deg", "model.sdf")
-    urdf_default = os.path.join(local_tb3_gazebo, "urdf", "turtlebot3_waffle.urdf")
+    robot_sdf_default = os.path.join(local_tb3_gazebo, "models", "turtlebot3_burger", "model.sdf")
+    urdf_default = os.path.join(local_tb3_gazebo, "urdf", "turtlebot3_burger.urdf")
 
     with open(urdf_default, "r", encoding="utf-8") as f:
         robot_description = f.read()
@@ -81,7 +81,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "use_scan_stabilizer",
             default_value="True",
-            description="Start scan stabilizer to suppress tilt-induced lidar artifacts",
+            description="Start scan stabilizer and publish /scan_stable",
         ),
         DeclareLaunchArgument(
             "planner_profile",
@@ -90,7 +90,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument("gui", default_value="True", description="Start Gazebo GUI"),
         DeclareLaunchArgument("rviz_config_file", default_value=rviz_default, description="RViz config"),
-        DeclareLaunchArgument("tb3_model", default_value="waffle", description="TurtleBot3 model"),
+        DeclareLaunchArgument("tb3_model", default_value="burger", description="TurtleBot3 model"),
         DeclareLaunchArgument(
             "tb3_models_path",
             default_value=os.path.join(local_tb3_gazebo, "models"),
@@ -101,7 +101,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("y_pose", default_value="-0.5", description="Robot y pose"),
         DeclareLaunchArgument("z_pose", default_value="0.01", description="Robot z pose"),
         DeclareLaunchArgument("yaw", default_value="0.0", description="Robot yaw"),
-        DeclareLaunchArgument("robot_name", default_value="turtlebot3_waffle", description="Robot name"),
+        DeclareLaunchArgument("robot_name", default_value="turtlebot3_burger", description="Robot name"),
         DeclareLaunchArgument("robot_sdf", default_value=robot_sdf_default, description="Robot SDF"),
     ]
 
@@ -192,8 +192,8 @@ def generate_launch_description() -> LaunchDescription:
                 "use_sim_time": use_sim_time,
                 "global_frame": "odom",
                 "robot_frame": "base_footprint",
-                "scan_topic": "/scan_stable",
                 "planner_profile": planner_profile,
+                "scan_topic": "/scan_stable",
             }
         ],
     )
@@ -209,13 +209,11 @@ def generate_launch_description() -> LaunchDescription:
                 "use_sim_time": use_sim_time,
                 "input_scan_topic": "/scan",
                 "output_scan_topic": "/scan_stable",
-                "tilt_status_topic": "/scan_tilt_exceeded",
                 "global_frame": "odom",
                 "base_frame": "base_footprint",
-                "max_roll_deg": 7.0,
-                "max_pitch_deg": 7.0,
-                "hard_stop_deg": 12.0,
-                "hysteresis_deg": 1.0,
+                "max_roll_deg": 5.0,
+                "max_pitch_deg": 5.0,
+                "hard_stop_deg": 8.0,
             }
         ],
     )
@@ -229,8 +227,11 @@ def generate_launch_description() -> LaunchDescription:
         parameters=[
             {
                 "use_sim_time": use_sim_time,
+                "scan_topic": "/scan_stable",
                 "input_cmd_topic": "/cmd_vel",
                 "output_cmd_topic": "/cmd_vel_safe",
+                "max_forward_speed": 0.11,
+                "max_turn_speed": 0.50,
             }
         ],
     )
@@ -266,8 +267,8 @@ def generate_launch_description() -> LaunchDescription:
     ld.add_action(start_gazebo_client_cmd)
     ld.add_action(robot_state_publisher_cmd)
     ld.add_action(gazebo_spawner_cmd)
-    ld.add_action(mapless_scan_stabilizer_cmd)
     ld.add_action(nav2_navigation_cmd)
+    ld.add_action(mapless_scan_stabilizer_cmd)
     ld.add_action(mapless_goal_manager_cmd)
     ld.add_action(mapless_safety_controller_cmd)
     ld.add_action(rviz_cmd)

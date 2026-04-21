@@ -31,9 +31,16 @@ exploration_coordinator:
     dynamic_inflation_goal_dist_m: 2.0
     dynamic_inflation_scale: 0.6
     dynamic_inflation_min_radius_m: 0.06
+    slim_inflation_fallback_enabled: True
     goal_snap_radius_cells: 12
     astar_revisit_cost_scale: 0.06
     decision_persistence_sec: 3.0
+    optimistic_unknown_cost_scale: 0.45
+
+    maze_mode: True
+    maze_cell_size_m: 0.40
+    maze_search_depth_limit: 80
+    maze_dead_end_penalty: 2.0
 
     # Sensor noise filter for transient pitch-induced occupancy speckles
     noise_filter_enabled: True
@@ -61,6 +68,9 @@ exploration_coordinator:
     candidate_min_separation_m: 0.45
     candidate_max_per_frontier: 3
     robot_candidate_min_distance_m: 0.35
+    candidate_inward_offset_m: 0.18
+    candidate_snap_radius_cells: 6
+    candidate_clearance_max_m: 1.2
 
     # Utility scoring weights
     w_info: 1.4
@@ -70,6 +80,7 @@ exploration_coordinator:
     w_turn: 0.35
     w_goal: 0.5
     w_commit: 0.45
+    w_clearance: 0.45
     goal_gravity_range_m: 6.0
     goal_gravity_exp_gain: 1.2
     goal_gravity_max_multiplier: 3.5

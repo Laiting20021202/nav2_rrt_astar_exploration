@@ -16,6 +16,7 @@ class FrontierScorer:
         self.w_turn = float(params.get("w_turn", 0.35))
         self.w_goal = float(params.get("w_goal", 0.45))
         self.w_commit = float(params.get("w_commit", 0.4))
+        self.w_clearance = float(params.get("w_clearance", 0.45))
 
         self.max_revisit_penalty = max(0.1, float(params.get("max_revisit_penalty", 6.0)))
         self.max_fail_penalty = max(0.1, float(params.get("max_fail_penalty", 8.0)))
@@ -45,6 +46,7 @@ class FrontierScorer:
 
         max_info = max(1e-3, max(c.information_gain for c in candidates))
         max_cost = max(1e-3, max(c.path_cost for c in candidates if math.isfinite(c.path_cost)))
+        max_clearance = max(1e-3, max(c.clearance_bonus for c in candidates))
         w_info_eff, w_goal_eff = self._effective_goal_weights(robot_pose, final_goal_xy)
 
         for c in candidates:
@@ -57,6 +59,7 @@ class FrontierScorer:
 
             goal_bonus_norm = max(0.0, min(1.0, c.goal_alignment_bonus))
             commit_norm = max(0.0, min(1.0, c.commitment_bonus))
+            clearance_norm = max(0.0, min(1.0, c.clearance_bonus / max_clearance))
 
             c.score = (
                 +w_info_eff * info_norm
@@ -66,6 +69,7 @@ class FrontierScorer:
                 -self.w_turn * turn_norm
                 +w_goal_eff * goal_bonus_norm
                 +self.w_commit * commit_norm
+                +self.w_clearance * clearance_norm
             )
 
         candidates.sort(key=lambda x: x.score, reverse=True)

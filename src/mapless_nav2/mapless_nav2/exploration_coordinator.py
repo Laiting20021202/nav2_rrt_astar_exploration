@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from collections import deque
+from dataclasses import dataclass, field
 import math
 import random
 from typing import Dict, List, Optional, Tuple
@@ -26,9 +28,14 @@ from .map_utils import (
     astar_path,
     build_inflated_obstacle_mask,
     euclidean,
+    grid_index,
     grid_to_world,
+    in_bounds,
+    is_unknown,
     known_cell_count,
+    line_collision_free,
     nearest_free_cell,
+    neighbors4,
     path_length_m,
     world_to_grid,
 )
@@ -43,6 +50,17 @@ def yaw_from_quaternion(q: Quaternion) -> float:
 
 def quaternion_from_yaw(yaw: float) -> Quaternion:
     return Quaternion(x=0.0, y=0.0, z=math.sin(yaw * 0.5), w=math.cos(yaw * 0.5))
+
+
+@dataclass
+class MazeCellMemory:
+    visited: bool = False
+    walls: Dict[str, bool] = field(
+        default_factory=lambda: {"N": False, "E": False, "S": False, "W": False}
+    )
+    dead_end: bool = False
+    has_unexplored_neighbor: bool = False
+    last_seen_sec: float = 0.0
 
 
 class ExplorationCoordinator(Node):
@@ -81,9 +99,16 @@ class ExplorationCoordinator(Node):
         self.declare_parameter("dynamic_inflation_goal_dist_m", 2.0)
         self.declare_parameter("dynamic_inflation_scale", 0.6)
         self.declare_parameter("dynamic_inflation_min_radius_m", 0.06)
+        self.declare_parameter("slim_inflation_fallback_enabled", True)
         self.declare_parameter("goal_snap_radius_cells", 12)
         self.declare_parameter("astar_revisit_cost_scale", 0.06)
         self.declare_parameter("decision_persistence_sec", 3.0)
+        self.declare_parameter("optimistic_unknown_cost_scale", 0.45)
+
+        self.declare_parameter("maze_mode", True)
+        self.declare_parameter("maze_cell_size_m", 0.40)
+        self.declare_parameter("maze_search_depth_limit", 80)
+        self.declare_parameter("maze_dead_end_penalty", 2.0)
 
         # Sensor noise stabilization (pitch-induced lidar artifacts)
         self.declare_parameter("noise_filter_enabled", True)
@@ -109,6 +134,7 @@ class ExplorationCoordinator(Node):
         self.declare_parameter("w_turn", 0.35)
         self.declare_parameter("w_goal", 0.5)
         self.declare_parameter("w_commit", 0.45)
+        self.declare_parameter("w_clearance", 0.45)
         self.declare_parameter("goal_gravity_range_m", 6.0)
         self.declare_parameter("goal_gravity_exp_gain", 1.2)
         self.declare_parameter("goal_gravity_max_multiplier", 3.5)
@@ -129,6 +155,9 @@ class ExplorationCoordinator(Node):
         self.declare_parameter("candidate_min_separation_m", 0.45)
         self.declare_parameter("candidate_max_per_frontier", 3)
         self.declare_parameter("robot_candidate_min_distance_m", 0.7)
+        self.declare_parameter("candidate_inward_offset_m", 0.18)
+        self.declare_parameter("candidate_snap_radius_cells", 6)
+        self.declare_parameter("candidate_clearance_max_m", 1.2)
 
         # Memory / anti-wandering
         self.declare_parameter("visited_decay_tau", 120.0)
@@ -177,9 +206,16 @@ class ExplorationCoordinator(Node):
         self.dynamic_inflation_goal_dist_m = float(self.get_parameter("dynamic_inflation_goal_dist_m").value)
         self.dynamic_inflation_scale = float(self.get_parameter("dynamic_inflation_scale").value)
         self.dynamic_inflation_min_radius_m = float(self.get_parameter("dynamic_inflation_min_radius_m").value)
+        self.slim_inflation_fallback_enabled = bool(self.get_parameter("slim_inflation_fallback_enabled").value)
         self.goal_snap_radius_cells = int(self.get_parameter("goal_snap_radius_cells").value)
         self.astar_revisit_cost_scale = float(self.get_parameter("astar_revisit_cost_scale").value)
         self.decision_persistence_sec = float(self.get_parameter("decision_persistence_sec").value)
+        self.optimistic_unknown_cost_scale = float(self.get_parameter("optimistic_unknown_cost_scale").value)
+
+        self.maze_mode = bool(self.get_parameter("maze_mode").value)
+        self.maze_cell_size_m = float(self.get_parameter("maze_cell_size_m").value)
+        self.maze_search_depth_limit = int(self.get_parameter("maze_search_depth_limit").value)
+        self.maze_dead_end_penalty = float(self.get_parameter("maze_dead_end_penalty").value)
 
         self.noise_filter_enabled = bool(self.get_parameter("noise_filter_enabled").value)
         self.noise_filter_transient_ttl_sec = float(self.get_parameter("noise_filter_transient_ttl_sec").value)
@@ -217,6 +253,9 @@ class ExplorationCoordinator(Node):
             "candidate_min_separation_m": float(self.get_parameter("candidate_min_separation_m").value),
             "candidate_max_per_frontier": int(self.get_parameter("candidate_max_per_frontier").value),
             "robot_candidate_min_distance_m": float(self.get_parameter("robot_candidate_min_distance_m").value),
+            "candidate_inward_offset_m": float(self.get_parameter("candidate_inward_offset_m").value),
+            "candidate_snap_radius_cells": int(self.get_parameter("candidate_snap_radius_cells").value),
+            "candidate_clearance_max_m": float(self.get_parameter("candidate_clearance_max_m").value),
         }
         self.extractor = FrontierExtractor(extractor_params)
 
@@ -248,6 +287,7 @@ class ExplorationCoordinator(Node):
             "w_turn": float(self.get_parameter("w_turn").value),
             "w_goal": float(self.get_parameter("w_goal").value),
             "w_commit": float(self.get_parameter("w_commit").value),
+            "w_clearance": float(self.get_parameter("w_clearance").value),
             "goal_gravity_range_m": self.goal_gravity_range_m,
             "goal_gravity_exp_gain": self.goal_gravity_exp_gain,
             "goal_gravity_max_multiplier": self.goal_gravity_max_multiplier,
@@ -304,8 +344,10 @@ class ExplorationCoordinator(Node):
         self.latest_map: Optional[OccupancyGrid] = None
         self.latest_inflated_mask: List[bool] = []
         self.latest_relaxed_inflated_mask: List[bool] = []
+        self.latest_goal_snap_cell: Optional[Tuple[int, int]] = None
         self.latest_soft_obstacle_cells: Dict[Tuple[int, int], float] = {}
         self.occupied_history: Dict[Tuple[int, int], Tuple[int, float]] = {}
+        self.maze_memory: Dict[Tuple[int, int], MazeCellMemory] = {}
         self.map_signature: Optional[Tuple[int, int, float]] = None
         self.latest_known_count = 0
 
@@ -339,6 +381,7 @@ class ExplorationCoordinator(Node):
             self.map_signature = signature
             self.occupied_history.clear()
             self.latest_soft_obstacle_cells = {}
+            self.maze_memory.clear()
 
         soft_obstacle_cells: Dict[Tuple[int, int], float] = {}
         if self.noise_filter_enabled:
@@ -419,6 +462,7 @@ class ExplorationCoordinator(Node):
             return
         self.final_goal = transformed
         self.final_goal_reachable_cache = False
+        self.latest_goal_snap_cell = None
         self.last_goal_reachability_stamp = 0.0
         self.publish_final_goal_marker()
         self.get_logger().info(
@@ -452,6 +496,7 @@ class ExplorationCoordinator(Node):
 
         self.final_goal = transformed
         self.final_goal_reachable_cache = False
+        self.latest_goal_snap_cell = None
         self.last_goal_reachability_stamp = 0.0
         self.publish_final_goal_marker()
         self.get_logger().info(
@@ -481,6 +526,8 @@ class ExplorationCoordinator(Node):
 
         self.memory.update_pose(robot_pose, now_sec, self.latest_known_count)
         self.memory.mark_cell_visited(robot_cell, now_sec, amount=0.25)
+        if self.maze_mode:
+            self.update_maze_memory(robot_cell, now_sec)
 
         dist_to_final_goal = float("inf")
         if self.final_goal is not None:
@@ -558,6 +605,11 @@ class ExplorationCoordinator(Node):
     ) -> Optional[NavigationTarget]:
         if self.latest_map is None:
             return None
+
+        if self.maze_mode:
+            maze_target = self.select_maze_target(robot_pose, robot_cell, now_sec, dist_to_final_goal)
+            if maze_target is not None:
+                return maze_target
 
         clusters = self.extractor.extract_frontier_clusters(self.latest_map, self.latest_inflated_mask)
         self.publish_frontier_markers(clusters)
@@ -680,6 +732,231 @@ class ExplorationCoordinator(Node):
             path_cells=best.path_cells,
         )
 
+    def select_maze_target(
+        self,
+        robot_pose: Pose2D,
+        robot_cell: Tuple[int, int],
+        now_sec: float,
+        dist_to_final_goal: float,
+    ) -> Optional[NavigationTarget]:
+        current_maze = self.grid_to_maze_cell(robot_cell)
+        current_state = self.maze_memory.get(current_maze)
+        if current_state is None:
+            return None
+
+        choices: List[Tuple[float, NavigationTarget]] = []
+        for direction, delta in (("N", (0, 1)), ("E", (1, 0)), ("S", (0, -1)), ("W", (-1, 0))):
+            if current_state.walls.get(direction, False):
+                continue
+            maze_cell = (current_maze[0] + delta[0], current_maze[1] + delta[1])
+            maze_id = "maze_%d_%d" % maze_cell
+            if not self.memory.frontier_available(maze_id, now_sec):
+                continue
+            neighbor_state = self.maze_memory.get(maze_cell)
+            if neighbor_state is not None and neighbor_state.dead_end and not neighbor_state.has_unexplored_neighbor:
+                continue
+            if neighbor_state is not None and neighbor_state.visited and not neighbor_state.has_unexplored_neighbor:
+                continue
+
+            target = self.build_maze_navigation_target(
+                maze_cell,
+                maze_id,
+                robot_pose,
+                robot_cell,
+                dist_to_final_goal,
+            )
+            if target is None:
+                continue
+
+            score = 0.0
+            if neighbor_state is None or not neighbor_state.visited:
+                score += 2.0
+            if neighbor_state is None or neighbor_state.has_unexplored_neighbor:
+                score += 2.0
+            if neighbor_state is not None and neighbor_state.dead_end:
+                score -= self.maze_dead_end_penalty
+            score -= 0.25 * path_length_m(target.path_cells, self.latest_map.info.resolution)
+            choices.append((score, target))
+
+        if choices:
+            choices.sort(key=lambda item: item[0], reverse=True)
+            return choices[0][1]
+
+        bfs_path = self.bfs_to_maze_branch(current_maze)
+        if bfs_path:
+            maze_cell = bfs_path[-1]
+            maze_id = "maze_%d_%d" % maze_cell
+            return self.build_maze_navigation_target(
+                maze_cell,
+                maze_id,
+                robot_pose,
+                robot_cell,
+                dist_to_final_goal,
+            )
+        return None
+
+    def build_maze_navigation_target(
+        self,
+        maze_cell: Tuple[int, int],
+        maze_id: str,
+        robot_pose: Pose2D,
+        robot_cell: Tuple[int, int],
+        dist_to_final_goal: float,
+    ) -> Optional[NavigationTarget]:
+        if self.latest_map is None:
+            return None
+
+        center_cell = self.maze_cell_center_grid(maze_cell)
+        staged = self.extractor.stage_candidate(
+            self.latest_map,
+            center_cell,
+            (robot_pose.x, robot_pose.y),
+            self.latest_inflated_mask,
+        )
+        if staged is None:
+            return None
+        target_cell, target_world = staged
+
+        strict_path, strict_cost = self.plan_on_known_free(
+            robot_cell,
+            target_cell,
+            dist_to_goal_m=dist_to_final_goal,
+            allow_unknown_fallback=False,
+        )
+        if not strict_path:
+            self.plan_on_known_free(
+                robot_cell,
+                target_cell,
+                dist_to_goal_m=dist_to_final_goal,
+                allow_unknown_fallback=True,
+            )
+            return None
+
+        target_yaw = self.compute_target_yaw(robot_pose, target_world)
+        return NavigationTarget(
+            target_type="frontier",
+            target_id=maze_id,
+            frontier_id=maze_id,
+            candidate_id=maze_id,
+            pose_world=(target_world[0], target_world[1], target_yaw),
+            path_cells=strict_path,
+        )
+
+    def bfs_to_maze_branch(self, start_cell: Tuple[int, int]) -> Optional[List[Tuple[int, int]]]:
+        queue = deque([(start_cell, [start_cell])])
+        visited = {start_cell}
+
+        while queue:
+            cell, path = queue.popleft()
+            if len(path) > self.maze_search_depth_limit:
+                continue
+            state = self.maze_memory.get(cell)
+            if state is None:
+                continue
+            if cell != start_cell and state.has_unexplored_neighbor and not state.dead_end:
+                return path
+
+            for direction, delta in (("N", (0, 1)), ("E", (1, 0)), ("S", (0, -1)), ("W", (-1, 0))):
+                if state.walls.get(direction, False):
+                    continue
+                nb = (cell[0] + delta[0], cell[1] + delta[1])
+                if nb in visited:
+                    continue
+                nb_state = self.maze_memory.get(nb)
+                if nb_state is None:
+                    continue
+                if nb_state.dead_end and not nb_state.has_unexplored_neighbor:
+                    continue
+                if not nb_state.visited and not nb_state.has_unexplored_neighbor:
+                    continue
+                visited.add(nb)
+                queue.append((nb, path + [nb]))
+        return None
+
+    def update_maze_memory(self, robot_cell: Tuple[int, int], now_sec: float) -> None:
+        if self.latest_map is None:
+            return
+        current_maze = self.grid_to_maze_cell(robot_cell)
+        cells_to_update = [current_maze]
+        for delta in ((0, 1), (1, 0), (0, -1), (-1, 0)):
+            cells_to_update.append((current_maze[0] + delta[0], current_maze[1] + delta[1]))
+
+        for maze_cell in cells_to_update:
+            state = self.maze_memory.setdefault(maze_cell, MazeCellMemory())
+            state.last_seen_sec = now_sec
+            if maze_cell == current_maze:
+                state.visited = True
+            state.has_unexplored_neighbor = self.maze_cell_has_unexplored_neighbor(maze_cell)
+            state.walls = {
+                "N": self.maze_edge_blocked(maze_cell, (0, 1)),
+                "E": self.maze_edge_blocked(maze_cell, (1, 0)),
+                "S": self.maze_edge_blocked(maze_cell, (0, -1)),
+                "W": self.maze_edge_blocked(maze_cell, (-1, 0)),
+            }
+            open_count = sum(0 if blocked else 1 for blocked in state.walls.values())
+            if state.visited and not state.has_unexplored_neighbor and open_count <= 1:
+                state.dead_end = True
+            elif state.has_unexplored_neighbor:
+                state.dead_end = False
+
+    def grid_to_maze_cell(self, cell: Tuple[int, int]) -> Tuple[int, int]:
+        stride = self.maze_stride_cells()
+        return (cell[0] // stride, cell[1] // stride)
+
+    def maze_cell_center_grid(self, maze_cell: Tuple[int, int]) -> Tuple[int, int]:
+        assert self.latest_map is not None
+        stride = self.maze_stride_cells()
+        width = int(self.latest_map.info.width)
+        height = int(self.latest_map.info.height)
+        cx = min(width - 1, max(0, maze_cell[0] * stride + stride // 2))
+        cy = min(height - 1, max(0, maze_cell[1] * stride + stride // 2))
+        return (cx, cy)
+
+    def maze_stride_cells(self) -> int:
+        if self.latest_map is None:
+            return 1
+        return max(1, int(round(self.maze_cell_size_m / max(self.latest_map.info.resolution, 1e-6))))
+
+    def maze_cell_has_unexplored_neighbor(self, maze_cell: Tuple[int, int]) -> bool:
+        if self.latest_map is None:
+            return False
+        width = int(self.latest_map.info.width)
+        height = int(self.latest_map.info.height)
+        stride = self.maze_stride_cells()
+        center = self.maze_cell_center_grid(maze_cell)
+        radius = max(1, stride // 2 + 1)
+
+        for dx in range(-radius, radius + 1):
+            for dy in range(-radius, radius + 1):
+                cell = (center[0] + dx, center[1] + dy)
+                if not in_bounds(width, height, cell):
+                    continue
+                if is_unknown(int(self.latest_map.data[grid_index(width, cell)])):
+                    return True
+        return False
+
+    def maze_edge_blocked(self, maze_cell: Tuple[int, int], delta: Tuple[int, int]) -> bool:
+        if self.latest_map is None:
+            return True
+        width = int(self.latest_map.info.width)
+        height = int(self.latest_map.info.height)
+        stride = self.maze_stride_cells()
+        start = self.maze_cell_center_grid(maze_cell)
+        target_cell = (maze_cell[0] + delta[0], maze_cell[1] + delta[1])
+        end = (target_cell[0] * stride + stride // 2, target_cell[1] * stride + stride // 2)
+        if not in_bounds(width, height, start) or not in_bounds(width, height, end):
+            return True
+        return not line_collision_free(
+            width,
+            height,
+            self.latest_inflated_mask,
+            self.latest_map.data,
+            start,
+            end,
+            self.free_threshold,
+            allow_unknown=True,
+        )
+
     def score_frontier_boundary_fallback(
         self,
         clusters,
@@ -714,7 +991,15 @@ class ExplorationCoordinator(Node):
             for idx, cell in enumerate(boundary):
                 if accepted >= max_per_frontier:
                     break
-                world = grid_to_world(self.latest_map, cell)
+                staged = self.extractor.stage_candidate(
+                    self.latest_map,
+                    cell,
+                    (robot_pose.x, robot_pose.y),
+                    self.latest_inflated_mask,
+                )
+                if staged is None:
+                    continue
+                cell, world = staged
                 if euclidean((robot_pose.x, robot_pose.y), world) < min_dist:
                     continue
                 path_cells, path_cost = self.plan_on_known_free(
@@ -739,6 +1024,7 @@ class ExplorationCoordinator(Node):
                 cand.heading_penalty = self.scorer.heading_change_penalty(robot_pose, cand.world)
                 cand.goal_alignment_bonus = self.scorer.goal_alignment_bonus(robot_pose, cand.world, final_goal_xy)
                 cand.commitment_bonus = self.memory.commitment_bonus(cand.frontier_id, now_sec)
+                cand.clearance_bonus = self.extractor.estimate_clearance(self.latest_map, cand.cell)
                 scored.append(cand)
                 accepted += 1
 
@@ -756,11 +1042,13 @@ class ExplorationCoordinator(Node):
         dist_to_final_goal: float,
     ) -> Tuple[bool, List[Tuple[int, int]], float]:
         if self.latest_map is None or self.final_goal is None:
+            self.latest_goal_snap_cell = None
             return (False, [], float("inf"))
 
         goal_xy = (self.final_goal.pose.position.x, self.final_goal.pose.position.y)
         goal_cell = world_to_grid(self.latest_map, goal_xy[0], goal_xy[1])
         if goal_cell is None:
+            self.latest_goal_snap_cell = None
             return (False, [], float("inf"))
 
         goal_cell = nearest_free_cell(
@@ -771,6 +1059,7 @@ class ExplorationCoordinator(Node):
             self.goal_snap_radius_cells,
         )
         if goal_cell is None:
+            self.latest_goal_snap_cell = None
             return (False, [], float("inf"))
 
         path_cells, path_cost = self.plan_on_known_free(
@@ -779,12 +1068,15 @@ class ExplorationCoordinator(Node):
             dist_to_goal_m=dist_to_final_goal,
         )
         if not path_cells:
+            self.latest_goal_snap_cell = None
             return (False, [], float("inf"))
 
         # Do not accept meaningless tiny path to near-obstacle snap point.
         path_m = path_length_m(path_cells, self.latest_map.info.resolution)
         if path_m < max(0.2, self.goal_tolerance_m * 0.5):
+            self.latest_goal_snap_cell = None
             return (False, [], float("inf"))
+        self.latest_goal_snap_cell = goal_cell
         return (True, path_cells, path_cost)
 
     def plan_on_known_free(
@@ -792,11 +1084,12 @@ class ExplorationCoordinator(Node):
         start: Tuple[int, int],
         goal: Tuple[int, int],
         dist_to_goal_m: float = float("inf"),
+        allow_unknown_fallback: bool = False,
     ) -> Tuple[List[Tuple[int, int]], float]:
         if self.latest_map is None:
             return ([], float("inf"))
 
-        def _plan_with_mask(mask: List[bool]) -> Tuple[List[Tuple[int, int]], float]:
+        def _plan_with_mask(mask: List[bool], allow_unknown: bool) -> Tuple[List[Tuple[int, int]], float]:
             start_free = nearest_free_cell(
                 self.latest_map,
                 start,
@@ -821,39 +1114,47 @@ class ExplorationCoordinator(Node):
                 start_free,
                 goal_free,
                 free_threshold=self.free_threshold,
-                allow_unknown=False,
+                allow_unknown=allow_unknown,
                 revisit_heat=self.memory.visited_heat,
                 revisit_cost_scale=self.astar_revisit_cost_scale,
                 soft_obstacle_cells=self.latest_soft_obstacle_cells,
                 soft_obstacle_cost_scale=self.noise_filter_soft_cost_scale,
+                unknown_cost_scale=self.optimistic_unknown_cost_scale if allow_unknown else 0.0,
             )
 
-        path_cells, path_cost = _plan_with_mask(self.latest_inflated_mask)
+        path_cells, path_cost = _plan_with_mask(self.latest_inflated_mask, allow_unknown=False)
         if path_cells:
             return (path_cells, path_cost)
 
-        can_relax = (
-            self.dynamic_inflation_enabled
-            and math.isfinite(dist_to_goal_m)
-            and dist_to_goal_m < self.dynamic_inflation_goal_dist_m
-            and bool(self.latest_relaxed_inflated_mask)
-            and (self.latest_relaxed_inflated_mask is not self.latest_inflated_mask)
+        can_relax = bool(self.latest_relaxed_inflated_mask) and (
+            self.latest_relaxed_inflated_mask is not self.latest_inflated_mask
         )
         if not can_relax:
             return ([], float("inf"))
 
-        relaxed_path, relaxed_cost = _plan_with_mask(self.latest_relaxed_inflated_mask)
+        relaxed_path, relaxed_cost = _plan_with_mask(self.latest_relaxed_inflated_mask, allow_unknown=False)
         if relaxed_path:
-            self.get_logger().debug(
-                "Dynamic inflation fallback succeeded (dist_to_goal=%.2f m)." % dist_to_goal_m
-            )
+            if self.slim_inflation_fallback_enabled or (
+                self.dynamic_inflation_enabled
+                and math.isfinite(dist_to_goal_m)
+                and dist_to_goal_m < self.dynamic_inflation_goal_dist_m
+            ):
+                self.get_logger().debug(
+                    "Inflation fallback succeeded (dist_to_goal=%.2f m)." % dist_to_goal_m
+                )
             return (relaxed_path, relaxed_cost)
+        if allow_unknown_fallback:
+            optimistic_path, optimistic_cost = _plan_with_mask(self.latest_relaxed_inflated_mask, allow_unknown=True)
+            if optimistic_path:
+                return (optimistic_path, optimistic_cost)
         return ([], float("inf"))
 
     def make_final_goal_target(self, path_cells: List[Tuple[int, int]]) -> NavigationTarget:
         assert self.final_goal is not None
         x = float(self.final_goal.pose.position.x)
         y = float(self.final_goal.pose.position.y)
+        if self.latest_map is not None and self.latest_goal_snap_cell is not None:
+            x, y = grid_to_world(self.latest_map, self.latest_goal_snap_cell)
         yaw = yaw_from_quaternion(self.final_goal.pose.orientation)
         return NavigationTarget(
             target_type="final",
@@ -974,6 +1275,7 @@ class ExplorationCoordinator(Node):
             self.trigger_recovery("frontier_nav_failed", now_sec)
         elif target.target_type == "final":
             self.final_goal_reachable_cache = False
+            self.latest_goal_snap_cell = None
             self.trigger_recovery("final_goal_nav_failed", now_sec)
 
         self.active_target = None
@@ -1023,6 +1325,7 @@ class ExplorationCoordinator(Node):
         self.target_lock_until = self.now_sec()
         self.final_goal = None
         self.final_goal_reachable_cache = False
+        self.latest_goal_snap_cell = None
         self.memory.clear_commitment()
         self.clear_final_goal_marker()
         self.mode = "FINISHED"

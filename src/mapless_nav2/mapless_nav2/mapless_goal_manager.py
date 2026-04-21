@@ -79,7 +79,6 @@ class MaplessGoalManager(Node):
         self.declare_parameter("active_subgoal_topic", "/mapless_active_subgoal")
         self.declare_parameter("goal_reached_topic", "/mapless_goal_reached")
         self.declare_parameter("safety_status_topic", "/mapless_safety_active")
-        self.declare_parameter("tilt_status_topic", "/scan_tilt_exceeded")
         self.declare_parameter("scan_topic", "/scan")
         self.declare_parameter("local_costmap_topic", "/local_costmap/costmap")
         self.declare_parameter("global_frame", "odom")
@@ -178,7 +177,6 @@ class MaplessGoalManager(Node):
         self.active_subgoal_topic = str(self.get_parameter("active_subgoal_topic").value)
         self.goal_reached_topic = str(self.get_parameter("goal_reached_topic").value)
         self.safety_status_topic = str(self.get_parameter("safety_status_topic").value)
-        self.tilt_status_topic = str(self.get_parameter("tilt_status_topic").value)
         self.scan_topic = str(self.get_parameter("scan_topic").value)
         self.local_costmap_topic = str(self.get_parameter("local_costmap_topic").value)
         self.global_frame = str(self.get_parameter("global_frame").value)
@@ -286,9 +284,6 @@ class MaplessGoalManager(Node):
             self.grid_dead_end_scale = 0.0
             self.experience_revisit_penalty_weight = 0.0
             self.experience_fail_penalty_weight = 0.0
-            # Disable dead-end memory side effects in baseline mode.
-            self.dead_end_replan_cost = 1.0e9
-            self.dead_end_memory_sec = 0.0
 
         self.rng = random.Random(self.rrt_random_seed)
 
@@ -303,7 +298,6 @@ class MaplessGoalManager(Node):
             self.rviz_goal_sub = None
         self.scan_sub = self.create_subscription(LaserScan, self.scan_topic, self.scan_callback, 10)
         self.safety_sub = self.create_subscription(Bool, self.safety_status_topic, self.safety_callback, 10)
-        self.tilt_sub = self.create_subscription(Bool, self.tilt_status_topic, self.tilt_callback, 10)
         self.local_costmap_sub = self.create_subscription(
             OccupancyGrid,
             self.local_costmap_topic,
@@ -363,7 +357,6 @@ class MaplessGoalManager(Node):
         self.consecutive_plan_failures = 0
         self.mission_memory_dirty = False
         self.last_memory_cloud_pub_time = now
-        self.last_tilt_purge_time = now
 
         self.get_logger().info(
             "Mapless planner ready: profile=%s grid=%s horizon=%.2f rrt_iters=%d dead_end_mem=%.0fs breadcrumb=%.2fm"
@@ -474,18 +467,6 @@ class MaplessGoalManager(Node):
 
     def safety_callback(self, msg: Bool) -> None:
         self.safety_active = bool(msg.data)
-
-    def tilt_callback(self, msg: Bool) -> None:
-        if not bool(msg.data):
-            return
-        now = self.get_clock().now()
-        if (now - self.last_tilt_purge_time) < Duration(seconds=1.0):
-            return
-        self.last_tilt_purge_time = now
-        if self.mission_obstacle_cells:
-            self.mission_obstacle_cells.clear()
-            self.mission_memory_dirty = True
-            self.publish_mission_memory_cloud(force=True)
 
     def timer_callback(self) -> None:
         if self.final_goal is None:

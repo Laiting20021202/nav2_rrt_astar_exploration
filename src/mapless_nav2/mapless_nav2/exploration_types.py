@@ -34,6 +34,7 @@ class FrontierCandidate:
     heading_penalty: float = 0.0
     goal_alignment_bonus: float = 0.0
     commitment_bonus: float = 0.0
+    clearance_bonus: float = 0.0
     score: float = -float("inf")
 
 

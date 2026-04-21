@@ -222,6 +222,7 @@ def astar_path(
     revisit_cost_scale: float = 0.0,
     soft_obstacle_cells: Optional[Dict[GridCell, float]] = None,
     soft_obstacle_cost_scale: float = 0.0,
+    unknown_cost_scale: float = 0.0,
 ) -> Tuple[List[GridCell], float]:
     width = int(msg.info.width)
     height = int(msg.info.height)
@@ -295,6 +296,8 @@ def astar_path(
             occupancy_term = 0.0
             if value >= 0:
                 occupancy_term = 0.2 * min(1.0, value / 100.0)
+            elif allow_unknown and unknown_cost_scale > 0.0:
+                occupancy_term = unknown_cost_scale
 
             soft_term = 0.0
             if soft_obstacle_cells is not None and soft_obstacle_cost_scale > 0.0:
