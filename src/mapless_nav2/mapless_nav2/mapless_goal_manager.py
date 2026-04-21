@@ -284,8 +284,6 @@ class MaplessGoalManager(Node):
             self.dead_end_sample_reject_prob = 0.0
             self.goal_progress_penalty_weight = 0.0
             self.grid_dead_end_scale = 0.0
-            self.experience_revisit_penalty_weight = 0.0
-            self.experience_fail_penalty_weight = 0.0
             # Disable dead-end memory side effects in baseline mode.
             self.dead_end_replan_cost = 1.0e9
             self.dead_end_memory_sec = 0.0
@@ -332,6 +330,7 @@ class MaplessGoalManager(Node):
         self.latest_scan: Optional[LaserScan] = None
         self.latest_local_costmap: Optional[OccupancyGrid] = None
         self.safety_active = False
+        self.tilt_active = False
         self.obstacle_points: Deque[Tuple[float, float, float]] = deque()
         self.mission_obstacle_cells: Dict[Tuple[int, int], float] = {}
         self.path_visit_cells: Dict[Tuple[int, int], int] = {}
@@ -425,6 +424,8 @@ class MaplessGoalManager(Node):
         )
 
     def scan_callback(self, msg: LaserScan) -> None:
+        if self.tilt_active:
+            return
         self.latest_scan = msg
 
         robot_pose = self.get_robot_pose(log_warning=False)
@@ -476,12 +477,15 @@ class MaplessGoalManager(Node):
         self.safety_active = bool(msg.data)
 
     def tilt_callback(self, msg: Bool) -> None:
-        if not bool(msg.data):
+        self.tilt_active = bool(msg.data)
+        if not self.tilt_active:
             return
         now = self.get_clock().now()
         if (now - self.last_tilt_purge_time) < Duration(seconds=1.0):
             return
         self.last_tilt_purge_time = now
+        if self.obstacle_points:
+            self.obstacle_points.clear()
         if self.mission_obstacle_cells:
             self.mission_obstacle_cells.clear()
             self.mission_memory_dirty = True
@@ -873,16 +877,16 @@ class MaplessGoalManager(Node):
         if self.final_goal is None:
             return None
 
-        guided_plan = self.plan_grid_path(robot_pose, obstacles)
-        if guided_plan is not None:
-            return guided_plan
-
         start = (robot_pose.x, robot_pose.y)
         fx = self.final_goal.pose.position.x
         fy = self.final_goal.pose.position.y
         goal = self.clip_goal_to_horizon(start, (fx, fy), self.planning_horizon)
         start_goal_dist = distance_xy(start[0], start[1], goal[0], goal[1])
         start_ignore_radius = max(self.subgoal_min_distance, 0.9 * self.collision_clearance)
+
+        guided_plan = self.plan_grid_path(robot_pose, obstacles)
+        if guided_plan is not None:
+            return guided_plan
 
         direct_penalty = self.segment_dead_end_cost(start, goal, start)
         if self.segment_collision_free(
@@ -893,6 +897,10 @@ class MaplessGoalManager(Node):
             ignore_radius=start_ignore_radius,
         ) and direct_penalty <= self.dead_end_replan_cost:
             return RRTPlan(path=[start, goal], tree_edges=[(start, goal)])
+
+        exploration_plan = self.plan_exploration_path(robot_pose, obstacles)
+        if exploration_plan is not None:
+            return exploration_plan
 
         tree: List[RRTNode] = [RRTNode(x=start[0], y=start[1], parent=-1, cost=0.0)]
         tree_edges: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
@@ -979,20 +987,7 @@ class MaplessGoalManager(Node):
                         goal_index = candidate_idx
 
         if goal_index < 0:
-            if best_frontier_idx < 0:
-                if len(tree) <= 1:
-                    return None
-                best_frontier_idx = max(
-                    range(1, len(tree)),
-                    key=lambda i: distance_xy(start[0], start[1], tree[i].x, tree[i].y),
-                )
-
-            best_dist = distance_xy(tree[best_frontier_idx].x, tree[best_frontier_idx].y, goal[0], goal[1])
-            progress_gain = start_goal_dist - best_dist
-            dist_from_start = distance_xy(start[0], start[1], tree[best_frontier_idx].x, tree[best_frontier_idx].y)
-            if dist_from_start < self.rrt_partial_min_length and progress_gain < 0.02:
-                return None
-            goal_index = best_frontier_idx
+            return self.plan_exploration_path(robot_pose, obstacles)
 
         path = self.extract_path(tree, goal_index)
         if len(path) >= 3:
@@ -1031,6 +1026,7 @@ class MaplessGoalManager(Node):
         start_h = self.grid_heuristic(start_cell, goal_cell)
         best_cell = start_cell
         best_rank = start_h
+        reached_goal = False
         heapq.heappush(open_heap, (start_h, 0.0, start_cell))
         expansions = 0
 
@@ -1048,6 +1044,7 @@ class MaplessGoalManager(Node):
 
             if self.grid_reached_goal(current, goal_cell):
                 best_cell = current
+                reached_goal = True
                 break
 
             current_world = self.grid_to_world(costmap, current)
@@ -1080,7 +1077,7 @@ class MaplessGoalManager(Node):
                 f_score = tentative_g + self.grid_heuristic_weight * heuristic
                 heapq.heappush(open_heap, (f_score, tentative_g, neighbor))
 
-        if best_cell == start_cell and len(parent) == 0:
+        if (not reached_goal) or (best_cell == start_cell and len(parent) == 0):
             return None
 
         path = self.reconstruct_grid_path(costmap, parent, start_cell, best_cell)
@@ -1090,6 +1087,88 @@ class MaplessGoalManager(Node):
             path = self.shortcut_path(path, obstacles)
 
         return RRTPlan(path=path, tree_edges=expanded_edges)
+
+    def plan_exploration_path(self, robot_pose: Pose2D, obstacles: List[Tuple[float, float]]) -> Optional[RRTPlan]:
+        if self.latest_local_costmap is None or self.final_goal is None:
+            return None
+
+        costmap = self.latest_local_costmap
+        start_world = (robot_pose.x, robot_pose.y)
+        start_cell = self.world_to_grid(costmap, start_world[0], start_world[1])
+        if start_cell is None:
+            return None
+        start_cell = self.find_nearest_free_cell(costmap, start_cell, max_radius=2)
+        if start_cell is None:
+            return None
+
+        fx = self.final_goal.pose.position.x
+        fy = self.final_goal.pose.position.y
+        start_goal_dist = distance_xy(start_world[0], start_world[1], fx, fy)
+        resolution = max(float(costmap.info.resolution), 1e-6)
+        min_path_m = max(0.8, self.subgoal_lookahead)
+
+        queue: Deque[Tuple[int, int]] = deque([start_cell])
+        parent: Dict[Tuple[int, int], Tuple[int, int]] = {}
+        dist_steps: Dict[Tuple[int, int], float] = {start_cell: 0.0}
+        visited = {start_cell}
+        expanded_edges: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+
+        best_cell: Optional[Tuple[int, int]] = None
+        best_score = -float("inf")
+        expansions = 0
+
+        while queue and expansions < self.grid_max_expansions:
+            current = queue.popleft()
+            expansions += 1
+            current_world = self.grid_to_world(costmap, current)
+            path_m = dist_steps[current] * resolution
+
+            unknown_neighbors = self.count_unknown_neighbors(costmap, current)
+            if unknown_neighbors > 0 and path_m >= min_path_m:
+                goal_progress = start_goal_dist - distance_xy(current_world[0], current_world[1], fx, fy)
+                experience_penalty = self.point_experience_penalty(current_world[0], current_world[1], start_world)
+                score = 1.4 * float(unknown_neighbors) + 0.45 * goal_progress - 0.12 * path_m - experience_penalty
+                if score > best_score:
+                    best_score = score
+                    best_cell = current
+
+            for neighbor, step_cost in self.iter_grid_neighbors(costmap, current):
+                if neighbor in visited:
+                    continue
+                neighbor_world = self.grid_to_world(costmap, neighbor)
+                if not self.segment_collision_free(current_world, neighbor_world, obstacles):
+                    continue
+                visited.add(neighbor)
+                parent[neighbor] = current
+                dist_steps[neighbor] = dist_steps[current] + step_cost
+                expanded_edges.append((current_world, neighbor_world))
+                queue.append(neighbor)
+
+        if best_cell is None:
+            return None
+
+        path = self.reconstruct_grid_path(costmap, parent, start_cell, best_cell)
+        if len(path) < 2:
+            return None
+        if len(path) >= 3:
+            path = self.shortcut_path(path, obstacles)
+        return RRTPlan(path=path, tree_edges=expanded_edges)
+
+    def count_unknown_neighbors(self, msg: OccupancyGrid, cell: Tuple[int, int]) -> int:
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        total = 0
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            nx = cell[0] + dx
+            ny = cell[1] + dy
+            if nx < 0 or ny < 0 or nx >= width or ny >= height:
+                continue
+            idx = ny * width + nx
+            if idx < 0 or idx >= len(msg.data):
+                continue
+            if int(msg.data[idx]) < 0:
+                total += 1
+        return total
 
     def sample_point(self, start: Tuple[float, float], goal: Tuple[float, float]) -> Tuple[float, float]:
         candidate = goal
@@ -1573,6 +1652,16 @@ class MaplessGoalManager(Node):
         if len(aligned) < 2:
             return self.make_pose(robot_pose.x, robot_pose.y, robot_pose.yaw)
 
+        if len(aligned) == 2:
+            gx, gy = aligned[-1]
+            gyaw = math.atan2(gy - robot_pose.y, gx - robot_pose.x)
+            if self.final_goal is not None:
+                fx = self.final_goal.pose.position.x
+                fy = self.final_goal.pose.position.y
+                if distance_xy(gx, gy, fx, fy) <= self.goal_tolerance:
+                    gyaw = yaw_from_quaternion(self.final_goal.pose.orientation)
+            return self.make_pose(gx, gy, gyaw)
+
         lookahead = max(self.subgoal_lookahead, 0.35)
         if front_clearance > 0.0:
             lookahead = min(lookahead, max(0.35, 0.9 * front_clearance))
@@ -1717,8 +1806,6 @@ class MaplessGoalManager(Node):
         self.record_path_memory(robot_pose, plan.path, self.path_visit_cells, increment=1.0)
 
     def record_failed_plan_memory(self, robot_pose: Pose2D, plan: RRTPlan) -> None:
-        if not self.advanced_mode:
-            return
         self.record_path_memory(robot_pose, plan.path, self.failed_branch_cells, increment=1.0)
 
     def record_path_memory(
@@ -2065,11 +2152,11 @@ class MaplessGoalManager(Node):
         marker.id = 0
         marker.type = Marker.LINE_LIST
         marker.action = Marker.ADD
-        marker.scale.x = 0.01
+        marker.scale.x = 0.04
         marker.color.r = 0.05
         marker.color.g = 0.75
         marker.color.b = 1.0
-        marker.color.a = 0.55
+        marker.color.a = 0.85
 
         for (x0, y0), (x1, y1) in plan.tree_edges:
             p0 = Point(x=float(x0), y=float(y0), z=0.03)

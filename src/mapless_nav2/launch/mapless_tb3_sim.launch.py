@@ -31,10 +31,11 @@ def generate_launch_description() -> LaunchDescription:
     nav2_launch_dir = os.path.join(pkg_nav2, "launch")
 
     params_default = os.path.join(pkg_mapless, "config", "nav2_mapless_params.yaml")
+    slam_params_default = os.path.join(pkg_mapless, "config", "slam_toolbox_online_async.yaml")
     rviz_default = os.path.join(pkg_mapless, "rviz", "mapless_nav2.rviz")
     world_default = os.path.join(local_tb3_gazebo, "worlds", "turtlebot3_house.world")
-    robot_sdf_default = os.path.join(pkg_mapless, "models", "turtlebot3_waffle_45deg", "model.sdf")
-    urdf_default = os.path.join(local_tb3_gazebo, "urdf", "turtlebot3_waffle.urdf")
+    robot_sdf_default = os.path.join(local_tb3_gazebo, "models", "turtlebot3_burger", "model.sdf")
+    urdf_default = os.path.join(local_tb3_gazebo, "urdf", "turtlebot3_burger.urdf")
 
     with open(urdf_default, "r", encoding="utf-8") as f:
         robot_description = f.read()
@@ -50,6 +51,8 @@ def generate_launch_description() -> LaunchDescription:
     use_rviz = LaunchConfiguration("use_rviz")
     use_safety_controller = LaunchConfiguration("use_safety_controller")
     use_scan_stabilizer = LaunchConfiguration("use_scan_stabilizer")
+    use_slam = LaunchConfiguration("use_slam")
+    slam_params_file = LaunchConfiguration("slam_params_file")
     planner_profile = LaunchConfiguration("planner_profile")
     gui = LaunchConfiguration("gui")
     rviz_config_file = LaunchConfiguration("rviz_config_file")
@@ -83,6 +86,8 @@ def generate_launch_description() -> LaunchDescription:
             default_value="True",
             description="Start scan stabilizer to suppress tilt-induced lidar artifacts",
         ),
+        DeclareLaunchArgument("use_slam", default_value="True", description="Start slam_toolbox for mission map building"),
+        DeclareLaunchArgument("slam_params_file", default_value=slam_params_default, description="SLAM Toolbox params file"),
         DeclareLaunchArgument(
             "planner_profile",
             default_value="baseline",
@@ -90,7 +95,7 @@ def generate_launch_description() -> LaunchDescription:
         ),
         DeclareLaunchArgument("gui", default_value="True", description="Start Gazebo GUI"),
         DeclareLaunchArgument("rviz_config_file", default_value=rviz_default, description="RViz config"),
-        DeclareLaunchArgument("tb3_model", default_value="waffle", description="TurtleBot3 model"),
+        DeclareLaunchArgument("tb3_model", default_value="burger", description="TurtleBot3 model"),
         DeclareLaunchArgument(
             "tb3_models_path",
             default_value=os.path.join(local_tb3_gazebo, "models"),
@@ -101,7 +106,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("y_pose", default_value="-0.5", description="Robot y pose"),
         DeclareLaunchArgument("z_pose", default_value="0.01", description="Robot z pose"),
         DeclareLaunchArgument("yaw", default_value="0.0", description="Robot yaw"),
-        DeclareLaunchArgument("robot_name", default_value="turtlebot3_waffle", description="Robot name"),
+        DeclareLaunchArgument("robot_name", default_value="turtlebot3_burger", description="Robot name"),
         DeclareLaunchArgument("robot_sdf", default_value=robot_sdf_default, description="Robot SDF"),
     ]
 
@@ -193,7 +198,17 @@ def generate_launch_description() -> LaunchDescription:
                 "global_frame": "odom",
                 "robot_frame": "base_footprint",
                 "scan_topic": "/scan_stable",
+                "local_costmap_topic": "/global_costmap/costmap",
                 "planner_profile": planner_profile,
+                "grid_planner_enabled": True,
+                "subgoal_lookahead": 1.5,
+                "collision_clearance": 0.16,
+                "mission_obstacle_hit_increment": 2.4,
+                "mission_obstacle_clear_decrement": 0.05,
+                "mission_obstacle_block_threshold": 0.65,
+                "mission_obstacle_block_radius": 0.18,
+                "experience_fail_penalty_weight": 1.6,
+                "experience_revisit_penalty_weight": 0.45,
             }
         ],
     )
@@ -211,17 +226,26 @@ def generate_launch_description() -> LaunchDescription:
                 "output_scan_topic": "/scan_stable",
                 "tilt_status_topic": "/scan_tilt_exceeded",
                 "global_frame": "odom",
-                "base_frame": "base_footprint",
+                "base_frame": "base_scan",
                 "odom_topic": "/odom",
-                "max_roll_deg": 7.0,
-                "max_pitch_deg": 7.0,
-                "hard_stop_deg": 12.0,
+                "max_roll_deg": 4.0,
+                "max_pitch_deg": 4.0,
+                "hard_stop_deg": 6.5,
                 "hysteresis_deg": 1.0,
-                "max_yaw_rate_deg_s": 22.0,
-                "max_yaw_delta_per_scan_deg": 2.5,
+                "max_yaw_rate_deg_s": 12.0,
+                "max_yaw_delta_per_scan_deg": 1.2,
                 "drop_scan_on_fast_turn": True,
             }
         ],
+    )
+
+    slam_toolbox_cmd = Node(
+        condition=IfCondition(use_slam),
+        package="slam_toolbox",
+        executable="async_slam_toolbox_node",
+        name="slam_toolbox",
+        output="screen",
+        parameters=[slam_params_file, {"use_sim_time": use_sim_time}],
     )
 
     mapless_safety_controller_cmd = Node(
@@ -271,6 +295,7 @@ def generate_launch_description() -> LaunchDescription:
     ld.add_action(robot_state_publisher_cmd)
     ld.add_action(gazebo_spawner_cmd)
     ld.add_action(mapless_scan_stabilizer_cmd)
+    ld.add_action(slam_toolbox_cmd)
     ld.add_action(nav2_navigation_cmd)
     ld.add_action(mapless_goal_manager_cmd)
     ld.add_action(mapless_safety_controller_cmd)

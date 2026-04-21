@@ -79,6 +79,7 @@ class ScanStabilizer(Node):
         self.tilt_blocked = False
         self.last_warn_sec = 0.0
         self.current_yaw_rate = 0.0
+        self.last_stable_scan: Optional[LaserScan] = None
 
         self.get_logger().info(
             "Scan stabilizer enabled: in=%s out=%s max_roll=%.1fdeg max_pitch=%.1fdeg max_yaw_rate=%.1fdeg/s max_yaw_delta=%.1fdeg"
@@ -99,7 +100,8 @@ class ScanStabilizer(Node):
         self.current_yaw_rate = float(msg.twist.twist.angular.z)
 
     def scan_callback(self, msg: LaserScan) -> None:
-        tilt = self.lookup_tilt()
+        sensor_frame = msg.header.frame_id.strip() if msg.header.frame_id else self.base_frame
+        tilt = self.lookup_tilt(sensor_frame)
         if tilt is None:
             # If TF is temporarily unavailable, do not drop scan data.
             self.scan_pub.publish(msg)
@@ -136,17 +138,27 @@ class ScanStabilizer(Node):
             self.tilt_blocked = True
 
         if self.tilt_blocked:
-            out = copy.copy(msg)
-            out.ranges = [float("inf")] * len(msg.ranges)
-            if msg.intensities:
-                out.intensities = [0.0] * len(msg.intensities)
-            self.scan_pub.publish(out)
             self.tilt_status_pub.publish(Bool(data=True))
             self.maybe_warn(roll, pitch, yaw_rate, scan_duration, fast_turn)
             return
 
         self.scan_pub.publish(msg)
         self.tilt_status_pub.publish(Bool(data=False))
+        self.last_stable_scan = copy.deepcopy(msg)
+
+    def make_suppressed_scan(self, msg: LaserScan) -> LaserScan:
+        if self.last_stable_scan is not None:
+            out = copy.deepcopy(self.last_stable_scan)
+            out.header = msg.header
+            out.scan_time = msg.scan_time
+            out.time_increment = msg.time_increment
+            return out
+
+        out = copy.copy(msg)
+        out.ranges = [float("inf")] * len(msg.ranges)
+        if msg.intensities:
+            out.intensities = [0.0] * len(msg.intensities)
+        return out
 
     def estimate_scan_duration(self, msg: LaserScan) -> float:
         if msg.scan_time > 1e-6:
@@ -183,11 +195,11 @@ class ScanStabilizer(Node):
             % (math.degrees(roll), math.degrees(pitch))
         )
 
-    def lookup_tilt(self) -> Optional[Tuple[float, float]]:
+    def lookup_tilt(self, sensor_frame: str) -> Optional[Tuple[float, float]]:
         try:
             tf_msg = self.tf_buffer.lookup_transform(
                 self.global_frame,
-                self.base_frame,
+                sensor_frame,
                 rclpy.time.Time(),
                 timeout=Duration(seconds=self.tf_timeout_sec),
             )
