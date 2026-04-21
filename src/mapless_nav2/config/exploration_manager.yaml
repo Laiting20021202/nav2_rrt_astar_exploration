@@ -27,8 +27,20 @@ exploration_coordinator:
     free_threshold: 15
     occupied_threshold: 65
     inflation_radius_m: 0.14
+    dynamic_inflation_enabled: True
+    dynamic_inflation_goal_dist_m: 2.0
+    dynamic_inflation_scale: 0.6
+    dynamic_inflation_min_radius_m: 0.06
     goal_snap_radius_cells: 12
     astar_revisit_cost_scale: 0.06
+    decision_persistence_sec: 3.0
+
+    # Sensor noise filter for transient pitch-induced occupancy speckles
+    noise_filter_enabled: True
+    noise_filter_transient_ttl_sec: 1.2
+    noise_filter_confirm_hits: 3
+    noise_filter_isolated_neighbor_max: 1
+    noise_filter_soft_cost_scale: 0.9
 
     frontier_filter_min_distance: 0.35
     frontier_filter_max_distance: 14.0
@@ -58,6 +70,10 @@ exploration_coordinator:
     w_turn: 0.35
     w_goal: 0.5
     w_commit: 0.45
+    goal_gravity_range_m: 6.0
+    goal_gravity_exp_gain: 1.2
+    goal_gravity_max_multiplier: 3.5
+    info_near_goal_min_scale: 0.35
 
     # Anti-revisit / anti-wandering memory
     visited_decay_tau: 120.0

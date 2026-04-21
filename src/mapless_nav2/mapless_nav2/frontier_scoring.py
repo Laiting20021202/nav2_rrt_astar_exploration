@@ -20,6 +20,18 @@ class FrontierScorer:
         self.max_revisit_penalty = max(0.1, float(params.get("max_revisit_penalty", 6.0)))
         self.max_fail_penalty = max(0.1, float(params.get("max_fail_penalty", 8.0)))
 
+        # Goal gravitation: near final goal -> stronger goal attraction, weaker exploration curiosity.
+        self.goal_gravity_range_m = max(0.1, float(params.get("goal_gravity_range_m", 6.0)))
+        self.goal_gravity_exp_gain = max(0.0, float(params.get("goal_gravity_exp_gain", 1.2)))
+        self.goal_gravity_max_multiplier = max(
+            1.0,
+            float(params.get("goal_gravity_max_multiplier", 3.5)),
+        )
+        self.info_near_goal_min_scale = max(
+            0.0,
+            min(1.0, float(params.get("info_near_goal_min_scale", 0.35))),
+        )
+
     def score_candidates(
         self,
         candidates: List[FrontierCandidate],
@@ -33,6 +45,7 @@ class FrontierScorer:
 
         max_info = max(1e-3, max(c.information_gain for c in candidates))
         max_cost = max(1e-3, max(c.path_cost for c in candidates if math.isfinite(c.path_cost)))
+        w_info_eff, w_goal_eff = self._effective_goal_weights(robot_pose, final_goal_xy)
 
         for c in candidates:
             info_norm = c.information_gain / max_info
@@ -46,12 +59,12 @@ class FrontierScorer:
             commit_norm = max(0.0, min(1.0, c.commitment_bonus))
 
             c.score = (
-                +self.w_info * info_norm
+                +w_info_eff * info_norm
                 -self.w_cost * cost_norm
                 -self.w_visit * visit_norm
                 -self.w_fail * fail_norm
                 -self.w_turn * turn_norm
-                +self.w_goal * goal_bonus_norm
+                +w_goal_eff * goal_bonus_norm
                 +self.w_commit * commit_norm
             )
 
@@ -81,3 +94,20 @@ class FrontierScorer:
         cosang = (vx1 * vx2 + vy1 * vy2) / max(1e-6, n1 * n2)
         # map [-1,1] -> [0,1]
         return 0.5 * (cosang + 1.0)
+
+    def _effective_goal_weights(self, robot_pose: Pose2D, final_goal_xy: Optional[tuple]) -> tuple:
+        if final_goal_xy is None:
+            return (self.w_info, self.w_goal)
+
+        dist_to_final_goal = math.hypot(final_goal_xy[0] - robot_pose.x, final_goal_xy[1] - robot_pose.y)
+        proximity = max(0.0, min(1.0, 1.0 - (dist_to_final_goal / self.goal_gravity_range_m)))
+
+        # Linear suppression of information gain weight when close to final goal.
+        info_scale = 1.0 - (1.0 - self.info_near_goal_min_scale) * proximity
+        w_info_eff = self.w_info * info_scale
+
+        # Exponential amplification of goal alignment weight near final goal.
+        goal_multiplier = math.exp(self.goal_gravity_exp_gain * proximity)
+        goal_multiplier = min(self.goal_gravity_max_multiplier, goal_multiplier)
+        w_goal_eff = self.w_goal * goal_multiplier
+        return (w_info_eff, w_goal_eff)

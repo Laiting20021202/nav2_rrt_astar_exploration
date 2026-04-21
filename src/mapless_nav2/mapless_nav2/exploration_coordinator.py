@@ -77,8 +77,20 @@ class ExplorationCoordinator(Node):
         self.declare_parameter("free_threshold", 15)
         self.declare_parameter("occupied_threshold", 65)
         self.declare_parameter("inflation_radius_m", 0.20)
+        self.declare_parameter("dynamic_inflation_enabled", True)
+        self.declare_parameter("dynamic_inflation_goal_dist_m", 2.0)
+        self.declare_parameter("dynamic_inflation_scale", 0.6)
+        self.declare_parameter("dynamic_inflation_min_radius_m", 0.06)
         self.declare_parameter("goal_snap_radius_cells", 12)
         self.declare_parameter("astar_revisit_cost_scale", 0.06)
+        self.declare_parameter("decision_persistence_sec", 3.0)
+
+        # Sensor noise stabilization (pitch-induced lidar artifacts)
+        self.declare_parameter("noise_filter_enabled", True)
+        self.declare_parameter("noise_filter_transient_ttl_sec", 1.2)
+        self.declare_parameter("noise_filter_confirm_hits", 3)
+        self.declare_parameter("noise_filter_isolated_neighbor_max", 1)
+        self.declare_parameter("noise_filter_soft_cost_scale", 0.9)
 
         # Frontier filtering
         self.declare_parameter("frontier_filter_min_distance", 0.6)
@@ -97,6 +109,10 @@ class ExplorationCoordinator(Node):
         self.declare_parameter("w_turn", 0.35)
         self.declare_parameter("w_goal", 0.5)
         self.declare_parameter("w_commit", 0.45)
+        self.declare_parameter("goal_gravity_range_m", 6.0)
+        self.declare_parameter("goal_gravity_exp_gain", 1.2)
+        self.declare_parameter("goal_gravity_max_multiplier", 3.5)
+        self.declare_parameter("info_near_goal_min_scale", 0.35)
 
         # Optional neural module
         self.declare_parameter("learned_ranker_enabled", False)
@@ -157,13 +173,29 @@ class ExplorationCoordinator(Node):
         self.free_threshold = int(self.get_parameter("free_threshold").value)
         self.occupied_threshold = int(self.get_parameter("occupied_threshold").value)
         self.inflation_radius_m = float(self.get_parameter("inflation_radius_m").value)
+        self.dynamic_inflation_enabled = bool(self.get_parameter("dynamic_inflation_enabled").value)
+        self.dynamic_inflation_goal_dist_m = float(self.get_parameter("dynamic_inflation_goal_dist_m").value)
+        self.dynamic_inflation_scale = float(self.get_parameter("dynamic_inflation_scale").value)
+        self.dynamic_inflation_min_radius_m = float(self.get_parameter("dynamic_inflation_min_radius_m").value)
         self.goal_snap_radius_cells = int(self.get_parameter("goal_snap_radius_cells").value)
         self.astar_revisit_cost_scale = float(self.get_parameter("astar_revisit_cost_scale").value)
+        self.decision_persistence_sec = float(self.get_parameter("decision_persistence_sec").value)
+
+        self.noise_filter_enabled = bool(self.get_parameter("noise_filter_enabled").value)
+        self.noise_filter_transient_ttl_sec = float(self.get_parameter("noise_filter_transient_ttl_sec").value)
+        self.noise_filter_confirm_hits = int(self.get_parameter("noise_filter_confirm_hits").value)
+        self.noise_filter_isolated_neighbor_max = int(self.get_parameter("noise_filter_isolated_neighbor_max").value)
+        self.noise_filter_soft_cost_scale = float(self.get_parameter("noise_filter_soft_cost_scale").value)
 
         self.frontier_filter_min_distance = float(self.get_parameter("frontier_filter_min_distance").value)
         self.frontier_filter_max_distance = float(self.get_parameter("frontier_filter_max_distance").value)
         self.max_scored_candidates = int(self.get_parameter("max_scored_candidates").value)
         self.candidate_max_per_frontier = int(self.get_parameter("candidate_max_per_frontier").value)
+
+        self.goal_gravity_range_m = float(self.get_parameter("goal_gravity_range_m").value)
+        self.goal_gravity_exp_gain = float(self.get_parameter("goal_gravity_exp_gain").value)
+        self.goal_gravity_max_multiplier = float(self.get_parameter("goal_gravity_max_multiplier").value)
+        self.info_near_goal_min_scale = float(self.get_parameter("info_near_goal_min_scale").value)
 
         self.recovery_cooldown_sec = float(self.get_parameter("recovery_cooldown_sec").value)
         self.max_frontier_failures_total = int(self.get_parameter("max_frontier_failures_total").value)
@@ -216,6 +248,10 @@ class ExplorationCoordinator(Node):
             "w_turn": float(self.get_parameter("w_turn").value),
             "w_goal": float(self.get_parameter("w_goal").value),
             "w_commit": float(self.get_parameter("w_commit").value),
+            "goal_gravity_range_m": self.goal_gravity_range_m,
+            "goal_gravity_exp_gain": self.goal_gravity_exp_gain,
+            "goal_gravity_max_multiplier": self.goal_gravity_max_multiplier,
+            "info_near_goal_min_scale": self.info_near_goal_min_scale,
         }
         self.scorer = FrontierScorer(scoring_params)
 
@@ -267,6 +303,10 @@ class ExplorationCoordinator(Node):
 
         self.latest_map: Optional[OccupancyGrid] = None
         self.latest_inflated_mask: List[bool] = []
+        self.latest_relaxed_inflated_mask: List[bool] = []
+        self.latest_soft_obstacle_cells: Dict[Tuple[int, int], float] = {}
+        self.occupied_history: Dict[Tuple[int, int], Tuple[int, float]] = {}
+        self.map_signature: Optional[Tuple[int, int, float]] = None
         self.latest_known_count = 0
 
         self.final_goal: Optional[PoseStamped] = None
@@ -283,17 +323,91 @@ class ExplorationCoordinator(Node):
         self.last_goal_reachability_stamp = 0.0
         self.last_feedback_remaining = float("inf")
         self.total_frontier_failures = 0
+        self.target_lock_until = 0.0
 
         self.get_logger().info("ExplorationCoordinator started. frontier memory + scoring + Nav2 switching active.")
 
     def map_callback(self, msg: OccupancyGrid) -> None:
         self.latest_map = msg
+        self.latest_known_count = known_cell_count(msg)
+
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        signature = (width, height, float(msg.info.resolution))
+        now_sec = self.now_sec()
+        if self.map_signature != signature:
+            self.map_signature = signature
+            self.occupied_history.clear()
+            self.latest_soft_obstacle_cells = {}
+
+        soft_obstacle_cells: Dict[Tuple[int, int], float] = {}
+        if self.noise_filter_enabled:
+            current_occupied = set()
+            for y in range(height):
+                base = y * width
+                for x in range(width):
+                    idx = base + x
+                    if int(msg.data[idx]) >= self.occupied_threshold:
+                        current_occupied.add((x, y))
+
+            ttl = max(0.05, self.noise_filter_transient_ttl_sec)
+            cutoff = now_sec - ttl
+            stale = [cell for cell, (_, stamp) in self.occupied_history.items() if stamp < cutoff]
+            for cell in stale:
+                del self.occupied_history[cell]
+
+            confirm_hits = max(1, self.noise_filter_confirm_hits)
+            for cell in current_occupied:
+                prev = self.occupied_history.get(cell)
+                if prev is not None and (now_sec - prev[1]) <= ttl:
+                    hit_count = min(confirm_hits + 2, prev[0] + 1)
+                else:
+                    hit_count = 1
+                self.occupied_history[cell] = (hit_count, now_sec)
+
+            max_neighbors = max(0, self.noise_filter_isolated_neighbor_max)
+            for cell in current_occupied:
+                hit_count, _ = self.occupied_history.get(cell, (1, now_sec))
+                if hit_count >= confirm_hits:
+                    continue
+
+                x, y = cell
+                occupied_neighbors = 0
+                for dx in (-1, 0, 1):
+                    for dy in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        if (x + dx, y + dy) in current_occupied:
+                            occupied_neighbors += 1
+                if occupied_neighbors <= max_neighbors:
+                    # Lower confidence -> lower traversal penalty.
+                    soft_weight = 1.0 - (hit_count / float(confirm_hits))
+                    soft_obstacle_cells[cell] = max(0.15, min(1.0, soft_weight))
+        else:
+            self.occupied_history.clear()
+
+        self.latest_soft_obstacle_cells = soft_obstacle_cells
+        ignored_cells = set(soft_obstacle_cells.keys())
         self.latest_inflated_mask = build_inflated_obstacle_mask(
             msg,
             occupied_threshold=self.occupied_threshold,
             inflation_radius_m=self.inflation_radius_m,
+            ignore_occupied_cells=ignored_cells,
         )
-        self.latest_known_count = known_cell_count(msg)
+
+        relaxed_radius_m = max(
+            self.dynamic_inflation_min_radius_m,
+            self.inflation_radius_m * self.dynamic_inflation_scale,
+        )
+        if (not self.dynamic_inflation_enabled) or abs(relaxed_radius_m - self.inflation_radius_m) < 1e-4:
+            self.latest_relaxed_inflated_mask = self.latest_inflated_mask
+        else:
+            self.latest_relaxed_inflated_mask = build_inflated_obstacle_mask(
+                msg,
+                occupied_threshold=self.occupied_threshold,
+                inflation_radius_m=relaxed_radius_m,
+                ignore_occupied_cells=ignored_cells,
+            )
 
     def goal_callback(self, msg: PoseStamped) -> None:
         transformed = self.transform_pose_to_global(msg)
@@ -368,12 +482,13 @@ class ExplorationCoordinator(Node):
         self.memory.update_pose(robot_pose, now_sec, self.latest_known_count)
         self.memory.mark_cell_visited(robot_cell, now_sec, amount=0.25)
 
+        dist_to_final_goal = float("inf")
         if self.final_goal is not None:
-            dist_to_goal = euclidean(
+            dist_to_final_goal = euclidean(
                 (robot_pose.x, robot_pose.y),
                 (self.final_goal.pose.position.x, self.final_goal.pose.position.y),
             )
-            if dist_to_goal <= self.goal_tolerance_m:
+            if dist_to_final_goal <= self.goal_tolerance_m:
                 self.on_final_goal_reached()
                 return
 
@@ -403,7 +518,7 @@ class ExplorationCoordinator(Node):
             (now_sec - self.last_goal_reachability_stamp) > self.goal_reachability_recheck_sec
             or not self.final_goal_reachable_cache
         ):
-            reachable, path_cells, _ = self.check_goal_reachable(robot_cell)
+            reachable, path_cells, _ = self.check_goal_reachable(robot_cell, dist_to_final_goal)
             self.final_goal_reachable_cache = reachable
             self.last_goal_reachability_stamp = now_sec
             if reachable:
@@ -424,7 +539,7 @@ class ExplorationCoordinator(Node):
             self.publish_state("EXPLORE_COMMIT")
             return
 
-        selected = self.select_frontier_target(robot_pose, robot_cell, now_sec)
+        selected = self.select_frontier_target(robot_pose, robot_cell, now_sec, dist_to_final_goal)
         if selected is None:
             self.publish_state("NO_FRONTIER")
             if self.final_goal is not None and self.memory.is_stagnating(now_sec):
@@ -439,6 +554,7 @@ class ExplorationCoordinator(Node):
         robot_pose: Pose2D,
         robot_cell: Tuple[int, int],
         now_sec: float,
+        dist_to_final_goal: float,
     ) -> Optional[NavigationTarget]:
         if self.latest_map is None:
             return None
@@ -472,7 +588,11 @@ class ExplorationCoordinator(Node):
                 for cand in candidates:
                     if cand.frontier_id != af:
                         continue
-                    path_cells, path_cost = self.plan_on_known_free(robot_cell, cand.cell)
+                    path_cells, path_cost = self.plan_on_known_free(
+                        robot_cell,
+                        cand.cell,
+                        dist_to_goal_m=dist_to_final_goal,
+                    )
                     if path_cells:
                         cand.path_cells = path_cells
                         cand.path_cost = path_cost
@@ -498,7 +618,11 @@ class ExplorationCoordinator(Node):
                 continue
             available_count += 1
 
-            path_cells, path_cost = self.plan_on_known_free(robot_cell, cand.cell)
+            path_cells, path_cost = self.plan_on_known_free(
+                robot_cell,
+                cand.cell,
+                dist_to_goal_m=dist_to_final_goal,
+            )
             if not path_cells:
                 continue
             path_ok_count += 1
@@ -519,6 +643,7 @@ class ExplorationCoordinator(Node):
                 robot_cell,
                 final_goal_xy,
                 now_sec,
+                dist_to_final_goal,
             )
             if fallback_scored:
                 self.publish_candidate_markers(fallback_scored)
@@ -562,6 +687,7 @@ class ExplorationCoordinator(Node):
         robot_cell: Tuple[int, int],
         final_goal_xy: Optional[Tuple[float, float]],
         now_sec: float,
+        dist_to_final_goal: float,
     ) -> List[FrontierCandidate]:
         if self.latest_map is None:
             return []
@@ -591,7 +717,11 @@ class ExplorationCoordinator(Node):
                 world = grid_to_world(self.latest_map, cell)
                 if euclidean((robot_pose.x, robot_pose.y), world) < min_dist:
                     continue
-                path_cells, path_cost = self.plan_on_known_free(robot_cell, cell)
+                path_cells, path_cost = self.plan_on_known_free(
+                    robot_cell,
+                    cell,
+                    dist_to_goal_m=dist_to_final_goal,
+                )
                 if not path_cells:
                     continue
 
@@ -620,7 +750,11 @@ class ExplorationCoordinator(Node):
         self.get_logger().info("Using boundary fallback candidates: %d" % len(scored))
         return scored
 
-    def check_goal_reachable(self, robot_cell: Tuple[int, int]) -> Tuple[bool, List[Tuple[int, int]], float]:
+    def check_goal_reachable(
+        self,
+        robot_cell: Tuple[int, int],
+        dist_to_final_goal: float,
+    ) -> Tuple[bool, List[Tuple[int, int]], float]:
         if self.latest_map is None or self.final_goal is None:
             return (False, [], float("inf"))
 
@@ -639,7 +773,11 @@ class ExplorationCoordinator(Node):
         if goal_cell is None:
             return (False, [], float("inf"))
 
-        path_cells, path_cost = self.plan_on_known_free(robot_cell, goal_cell)
+        path_cells, path_cost = self.plan_on_known_free(
+            robot_cell,
+            goal_cell,
+            dist_to_goal_m=dist_to_final_goal,
+        )
         if not path_cells:
             return (False, [], float("inf"))
 
@@ -653,37 +791,64 @@ class ExplorationCoordinator(Node):
         self,
         start: Tuple[int, int],
         goal: Tuple[int, int],
+        dist_to_goal_m: float = float("inf"),
     ) -> Tuple[List[Tuple[int, int]], float]:
         if self.latest_map is None:
             return ([], float("inf"))
-        start_free = nearest_free_cell(
-            self.latest_map,
-            start,
-            self.latest_inflated_mask,
-            self.free_threshold,
-            self.goal_snap_radius_cells,
+
+        def _plan_with_mask(mask: List[bool]) -> Tuple[List[Tuple[int, int]], float]:
+            start_free = nearest_free_cell(
+                self.latest_map,
+                start,
+                mask,
+                self.free_threshold,
+                self.goal_snap_radius_cells,
+            )
+            if start_free is None:
+                return ([], float("inf"))
+            goal_free = nearest_free_cell(
+                self.latest_map,
+                goal,
+                mask,
+                self.free_threshold,
+                self.goal_snap_radius_cells,
+            )
+            if goal_free is None:
+                return ([], float("inf"))
+            return astar_path(
+                self.latest_map,
+                mask,
+                start_free,
+                goal_free,
+                free_threshold=self.free_threshold,
+                allow_unknown=False,
+                revisit_heat=self.memory.visited_heat,
+                revisit_cost_scale=self.astar_revisit_cost_scale,
+                soft_obstacle_cells=self.latest_soft_obstacle_cells,
+                soft_obstacle_cost_scale=self.noise_filter_soft_cost_scale,
+            )
+
+        path_cells, path_cost = _plan_with_mask(self.latest_inflated_mask)
+        if path_cells:
+            return (path_cells, path_cost)
+
+        can_relax = (
+            self.dynamic_inflation_enabled
+            and math.isfinite(dist_to_goal_m)
+            and dist_to_goal_m < self.dynamic_inflation_goal_dist_m
+            and bool(self.latest_relaxed_inflated_mask)
+            and (self.latest_relaxed_inflated_mask is not self.latest_inflated_mask)
         )
-        if start_free is None:
+        if not can_relax:
             return ([], float("inf"))
-        goal_free = nearest_free_cell(
-            self.latest_map,
-            goal,
-            self.latest_inflated_mask,
-            self.free_threshold,
-            self.goal_snap_radius_cells,
-        )
-        if goal_free is None:
-            return ([], float("inf"))
-        return astar_path(
-            self.latest_map,
-            self.latest_inflated_mask,
-            start_free,
-            goal_free,
-            free_threshold=self.free_threshold,
-            allow_unknown=False,
-            revisit_heat=self.memory.visited_heat,
-            revisit_cost_scale=self.astar_revisit_cost_scale,
-        )
+
+        relaxed_path, relaxed_cost = _plan_with_mask(self.latest_relaxed_inflated_mask)
+        if relaxed_path:
+            self.get_logger().debug(
+                "Dynamic inflation fallback succeeded (dist_to_goal=%.2f m)." % dist_to_goal_m
+            )
+            return (relaxed_path, relaxed_cost)
+        return ([], float("inf"))
 
     def make_final_goal_target(self, path_cells: List[Tuple[int, int]]) -> NavigationTarget:
         assert self.final_goal is not None
@@ -707,6 +872,15 @@ class ExplorationCoordinator(Node):
             self.publish_selected_path(target.path_cells)
             return
 
+        if self.active_target is not None and now_sec < self.target_lock_until:
+            if not self.active_target_has_fatal_conflict(now_sec):
+                # Decision persistence: keep current target for a short horizon.
+                self.publish_selected_target(self.active_target)
+                self.publish_selected_path(self.active_target.path_cells)
+                self.last_plan_stamp = now_sec
+                return
+            self.get_logger().warn("Decision lock overridden due to fatal path conflict.")
+
         self.cancel_active_navigation()
 
         if not self.nav_client.server_is_ready():
@@ -724,6 +898,7 @@ class ExplorationCoordinator(Node):
 
         self.active_target = target
         self.last_plan_stamp = now_sec
+        self.target_lock_until = now_sec + max(0.0, self.decision_persistence_sec)
         if target.frontier_id is not None:
             self.memory.register_frontier_selected(target.frontier_id, now_sec)
 
@@ -751,6 +926,7 @@ class ExplorationCoordinator(Node):
                 self.register_frontier_failure(target.frontier_id, self.now_sec(), "goal_rejected")
             self.active_goal_handle = None
             self.active_target = None
+            self.target_lock_until = self.now_sec()
             return
 
         self.active_goal_handle = goal_handle
@@ -788,6 +964,7 @@ class ExplorationCoordinator(Node):
                 self.memory.register_frontier_success(target.frontier_id)
                 self.memory.mark_path_visited(target.path_cells, now_sec)
             self.active_target = None
+            self.target_lock_until = now_sec
             self.last_plan_stamp = 0.0
             self.mode = "EXPLORING"
             return
@@ -800,6 +977,7 @@ class ExplorationCoordinator(Node):
             self.trigger_recovery("final_goal_nav_failed", now_sec)
 
         self.active_target = None
+        self.target_lock_until = now_sec
 
     def register_frontier_failure(self, frontier_id: Optional[str], now_sec: float, reason: str) -> None:
         if frontier_id is None:
@@ -817,6 +995,7 @@ class ExplorationCoordinator(Node):
     def trigger_recovery(self, reason: str, now_sec: float) -> None:
         self.cancel_active_navigation()
         self.memory.clear_commitment()
+        self.target_lock_until = now_sec
 
         req = ClearEntireCostmap.Request()
         if self.clear_local_client.service_is_ready():
@@ -841,6 +1020,7 @@ class ExplorationCoordinator(Node):
     def on_final_goal_reached(self) -> None:
         self.cancel_active_navigation()
         self.active_target = None
+        self.target_lock_until = self.now_sec()
         self.final_goal = None
         self.final_goal_reachable_cache = False
         self.memory.clear_commitment()
@@ -911,6 +1091,43 @@ class ExplorationCoordinator(Node):
 
     def compute_target_yaw(self, robot_pose: Pose2D, target_xy: Tuple[float, float]) -> float:
         return math.atan2(target_xy[1] - robot_pose.y, target_xy[0] - robot_pose.x)
+
+    def active_target_has_fatal_conflict(self, now_sec: float) -> bool:
+        if self.active_target is None or self.latest_map is None:
+            return False
+
+        robot_pose = self.get_robot_pose()
+        if robot_pose is None:
+            return False
+        robot_cell = world_to_grid(self.latest_map, robot_pose.x, robot_pose.y)
+        if robot_cell is None:
+            return True
+
+        target_cell = world_to_grid(
+            self.latest_map,
+            self.active_target.pose_world[0],
+            self.active_target.pose_world[1],
+        )
+        if target_cell is None:
+            return True
+
+        dist_to_final_goal = float("inf")
+        if self.final_goal is not None:
+            dist_to_final_goal = euclidean(
+                (robot_pose.x, robot_pose.y),
+                (self.final_goal.pose.position.x, self.final_goal.pose.position.y),
+            )
+        path_cells, _ = self.plan_on_known_free(
+            robot_cell,
+            target_cell,
+            dist_to_goal_m=dist_to_final_goal,
+        )
+        if path_cells:
+            return False
+
+        if (now_sec - self.last_plan_stamp) > 0.5:
+            self.get_logger().warn("Active target became unreachable, unlocking persistence.")
+        return True
 
     def is_same_target(self, a: NavigationTarget, b: NavigationTarget) -> bool:
         if a.target_type != b.target_type:
