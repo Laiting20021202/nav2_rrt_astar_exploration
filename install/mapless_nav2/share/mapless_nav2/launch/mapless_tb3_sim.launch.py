@@ -1,1 +1,0 @@
-/home/david/Desktop/laiting/navigation/build/mapless_nav2/launch/mapless_tb3_sim.launch.py

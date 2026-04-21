@@ -1,6 +1,0 @@
-source;share/vint_train/hook/pythonpath.ps1
-source;share/vint_train/hook/pythonpath.dsv
-source;share/vint_train/hook/pythonpath.sh
-source;../../build/vint_train/share/vint_train/hook/pythonpath_develop.ps1
-source;../../build/vint_train/share/vint_train/hook/pythonpath_develop.dsv
-source;../../build/vint_train/share/vint_train/hook/pythonpath_develop.sh
