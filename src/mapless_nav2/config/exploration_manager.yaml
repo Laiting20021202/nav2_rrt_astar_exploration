@@ -34,7 +34,7 @@ exploration_coordinator:
     slim_inflation_fallback_enabled: True
     goal_snap_radius_cells: 12
     astar_revisit_cost_scale: 0.06
-    decision_persistence_sec: 3.0
+    decision_persistence_sec: 0.5
     optimistic_unknown_cost_scale: 0.45
 
     maze_mode: False
@@ -49,14 +49,14 @@ exploration_coordinator:
     noise_filter_isolated_neighbor_max: 1
     noise_filter_soft_cost_scale: 0.9
 
-    frontier_filter_min_distance: 0.35
+    frontier_filter_min_distance: 0.15
     frontier_filter_max_distance: 14.0
     max_scored_candidates: 24
 
     recovery_cooldown_sec: 3.0
-    max_frontier_failures_total: 80
+    max_frontier_failures_total: 9999
 
-    frontier_min_cluster_size: 6
+    frontier_min_cluster_size: 3
     frontier_info_gain_radius_m: 1.1
 
     rrt_iterations: 500
@@ -67,7 +67,7 @@ exploration_coordinator:
 
     candidate_min_separation_m: 0.45
     candidate_max_per_frontier: 3
-    robot_candidate_min_distance_m: 0.35
+    robot_candidate_min_distance_m: 0.20
     candidate_inward_offset_m: 0.18
     candidate_snap_radius_cells: 6
     candidate_clearance_max_m: 1.2
@@ -91,10 +91,10 @@ exploration_coordinator:
     visited_increment: 1.0
     visited_prune_threshold: 0.03
 
-    frontier_cooldown_sec: 12.0
-    frontier_blacklist_base_sec: 25.0
-    frontier_blacklist_max_sec: 240.0
-    frontier_fail_blacklist_threshold: 2
+    frontier_cooldown_sec: 0.5
+    frontier_blacklist_base_sec: 1.0
+    frontier_blacklist_max_sec: 2.0
+    frontier_fail_blacklist_threshold: 999
 
     commitment_horizon_sec: 10.0
 

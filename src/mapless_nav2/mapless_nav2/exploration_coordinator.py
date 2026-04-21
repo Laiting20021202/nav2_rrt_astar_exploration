@@ -632,6 +632,10 @@ class ExplorationCoordinator(Node):
         self.publish_rrt_tree(tree_edges)
 
         if not candidates:
+            self.get_logger().warn(
+                "No frontier candidates generated. maze_mode=%s memory=%s"
+                % (str(self.maze_mode), self.frontier_memory_summary(now_sec))
+            )
             self.clear_candidate_markers()
             return None
 
@@ -669,6 +673,10 @@ class ExplorationCoordinator(Node):
         path_ok_count = 0
         for cand in candidates:
             if not self.memory.frontier_available(cand.frontier_id, now_sec):
+                self.get_logger().info(
+                    "Candidate filtered by frontier memory: frontier_id=%s reason=%s"
+                    % (cand.frontier_id, self.frontier_block_reason(cand.frontier_id, now_sec))
+                )
                 continue
             available_count += 1
 
@@ -689,6 +697,11 @@ class ExplorationCoordinator(Node):
             cand.goal_alignment_bonus = self.scorer.goal_alignment_bonus(robot_pose, cand.world, final_goal_xy)
             cand.commitment_bonus = self.memory.commitment_bonus(cand.frontier_id, now_sec)
             scored.append(cand)
+
+        self.get_logger().info(
+            "Frontier candidate summary: total=%d available=%d path_ok=%d"
+            % (len(candidates), available_count, path_ok_count)
+        )
 
         if not scored:
             fallback_scored = self.score_frontier_boundary_fallback(
@@ -712,8 +725,14 @@ class ExplorationCoordinator(Node):
                     path_cells=best.path_cells,
                 )
             self.get_logger().warn(
-                "No scored frontier candidate: total=%d available=%d path_ok=%d"
-                % (len(candidates), available_count, path_ok_count)
+                "No scored frontier candidate: total=%d available=%d path_ok=%d maze_mode=%s memory=%s"
+                % (
+                    len(candidates),
+                    available_count,
+                    path_ok_count,
+                    str(self.maze_mode),
+                    self.frontier_memory_summary(now_sec),
+                )
             )
             self.clear_candidate_markers()
             return None
@@ -1573,7 +1592,7 @@ class ExplorationCoordinator(Node):
         marker.id = 0
         marker.type = Marker.LINE_LIST
         marker.action = Marker.ADD
-        marker.scale.x = 0.04
+        marker.scale.x = 0.05
         marker.color.r = 0.0
         marker.color.g = 0.9
         marker.color.b = 1.0
@@ -1593,6 +1612,30 @@ class ExplorationCoordinator(Node):
         marker.id = 0
         marker.action = Marker.DELETE
         self.rrt_tree_pub.publish(marker)
+
+    def frontier_block_reason(self, frontier_id: str, now_sec: float) -> str:
+        reasons = []
+        blacklist_until = self.memory.frontier_blacklist_until.get(frontier_id, 0.0)
+        cooldown_until = self.memory.frontier_cooldown_until.get(frontier_id, 0.0)
+        if blacklist_until > now_sec:
+            reasons.append("blacklist %.2fs" % (blacklist_until - now_sec))
+        if cooldown_until > now_sec:
+            reasons.append("cooldown %.2fs" % (cooldown_until - now_sec))
+        if not reasons:
+            reasons.append("unknown")
+        return ", ".join(reasons)
+
+    def frontier_memory_summary(self, now_sec: float) -> str:
+        active_cooldowns = sum(1 for t in self.memory.frontier_cooldown_until.values() if t > now_sec)
+        active_blacklists = sum(1 for t in self.memory.frontier_blacklist_until.values() if t > now_sec)
+        committed = self.memory.committed_frontier_id or "none"
+        tracked_failures = len(self.memory.frontier_fail_count)
+        return "cooldowns=%d blacklists=%d committed=%s tracked_failures=%d" % (
+            active_cooldowns,
+            active_blacklists,
+            committed,
+            tracked_failures,
+        )
 
     def publish_selected_target(self, target: NavigationTarget) -> None:
         m = Marker()
