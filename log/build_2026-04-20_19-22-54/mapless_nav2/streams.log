@@ -1,0 +1,27 @@
+[0.385s] Invoking command in '/home/david/Desktop/laiting/navigation/src/mapless_nav2': PYTHONPATH=/home/david/Desktop/laiting/navigation/build/mapless_nav2/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/mapless_nav2 build --build-base /home/david/Desktop/laiting/navigation/build/mapless_nav2/build install --record /home/david/Desktop/laiting/navigation/build/mapless_nav2/install.log --single-version-externally-managed install_data
+[0.534s] running egg_info
+[0.535s] writing ../../build/mapless_nav2/mapless_nav2.egg-info/PKG-INFO
+[0.535s] writing dependency_links to ../../build/mapless_nav2/mapless_nav2.egg-info/dependency_links.txt
+[0.535s] writing entry points to ../../build/mapless_nav2/mapless_nav2.egg-info/entry_points.txt
+[0.535s] writing requirements to ../../build/mapless_nav2/mapless_nav2.egg-info/requires.txt
+[0.535s] writing top-level names to ../../build/mapless_nav2/mapless_nav2.egg-info/top_level.txt
+[0.536s] reading manifest file '../../build/mapless_nav2/mapless_nav2.egg-info/SOURCES.txt'
+[0.536s] writing manifest file '../../build/mapless_nav2/mapless_nav2.egg-info/SOURCES.txt'
+[0.536s] running build
+[0.536s] running build_py
+[0.537s] copying mapless_nav2/mapless_goal_manager.py -> /home/david/Desktop/laiting/navigation/build/mapless_nav2/build/lib/mapless_nav2
+[0.537s] running install
+[0.537s] running install_lib
+[0.537s] copying /home/david/Desktop/laiting/navigation/build/mapless_nav2/build/lib/mapless_nav2/mapless_goal_manager.py -> /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/python3.10/site-packages/mapless_nav2
+[0.537s] byte-compiling /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/python3.10/site-packages/mapless_nav2/mapless_goal_manager.py to mapless_goal_manager.cpython-310.pyc
+[0.546s] running install_data
+[0.546s] copying launch/mapless_tb3_sim.launch.py -> /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/mapless_nav2/launch
+[0.546s] running install_egg_info
+[0.547s] removing '/home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/python3.10/site-packages/mapless_nav2-0.1.0-py3.10.egg-info' (and everything under it)
+[0.547s] Copying ../../build/mapless_nav2/mapless_nav2.egg-info to /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/python3.10/site-packages/mapless_nav2-0.1.0-py3.10.egg-info
+[0.547s] running install_scripts
+[0.558s] Installing mapless_goal_manager script to /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/mapless_nav2
+[0.559s] Installing mapless_safety_controller script to /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/mapless_nav2
+[0.559s] Installing mapless_send_goal script to /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/mapless_nav2
+[0.559s] writing list of installed files to '/home/david/Desktop/laiting/navigation/build/mapless_nav2/install.log'
+[0.570s] Invoked command in '/home/david/Desktop/laiting/navigation/src/mapless_nav2' returned '0': PYTHONPATH=/home/david/Desktop/laiting/navigation/build/mapless_nav2/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/mapless_nav2 build --build-base /home/david/Desktop/laiting/navigation/build/mapless_nav2/build install --record /home/david/Desktop/laiting/navigation/build/mapless_nav2/install.log --single-version-externally-managed install_data

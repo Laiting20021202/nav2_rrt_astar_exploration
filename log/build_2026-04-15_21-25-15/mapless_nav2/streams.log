@@ -1,0 +1,18 @@
+[0.365s] Invoking command in '/home/david/Desktop/laiting/navigation/build/mapless_nav2': PYTHONPATH=/home/david/Desktop/laiting/navigation/build/mapless_nav2/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/david/Desktop/laiting/navigation/build/mapless_nav2/build --no-deps symlink_data
+[0.514s] running develop
+[0.626s] running egg_info
+[0.626s] writing mapless_nav2.egg-info/PKG-INFO
+[0.626s] writing dependency_links to mapless_nav2.egg-info/dependency_links.txt
+[0.626s] writing entry points to mapless_nav2.egg-info/entry_points.txt
+[0.626s] writing requirements to mapless_nav2.egg-info/requires.txt
+[0.626s] writing top-level names to mapless_nav2.egg-info/top_level.txt
+[0.627s] reading manifest file 'mapless_nav2.egg-info/SOURCES.txt'
+[0.628s] writing manifest file 'mapless_nav2.egg-info/SOURCES.txt'
+[0.628s] running build_ext
+[0.628s] Creating /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/python3.10/site-packages/mapless-nav2.egg-link (link to .)
+[0.629s] Installing mapless_goal_manager script to /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/mapless_nav2
+[0.629s] Installing mapless_send_goal script to /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/mapless_nav2
+[0.629s] 
+[0.629s] Installed /home/david/Desktop/laiting/navigation/build/mapless_nav2
+[0.629s] running symlink_data
+[0.642s] Invoked command in '/home/david/Desktop/laiting/navigation/build/mapless_nav2' returned '0': PYTHONPATH=/home/david/Desktop/laiting/navigation/build/mapless_nav2/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/python3.10/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/david/Desktop/laiting/navigation/build/mapless_nav2/build --no-deps symlink_data

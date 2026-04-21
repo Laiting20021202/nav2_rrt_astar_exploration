@@ -1,0 +1,29 @@
+running develop
+running egg_info
+creating mapless_nav2.egg-info
+writing mapless_nav2.egg-info/PKG-INFO
+writing dependency_links to mapless_nav2.egg-info/dependency_links.txt
+writing entry points to mapless_nav2.egg-info/entry_points.txt
+writing requirements to mapless_nav2.egg-info/requires.txt
+writing top-level names to mapless_nav2.egg-info/top_level.txt
+writing manifest file 'mapless_nav2.egg-info/SOURCES.txt'
+reading manifest file 'mapless_nav2.egg-info/SOURCES.txt'
+writing manifest file 'mapless_nav2.egg-info/SOURCES.txt'
+running build_ext
+Creating /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/python3.10/site-packages/mapless-nav2.egg-link (link to .)
+Installing mapless_goal_manager script to /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/mapless_nav2
+Installing mapless_send_goal script to /home/david/Desktop/laiting/navigation/install/mapless_nav2/lib/mapless_nav2
+
+Installed /home/david/Desktop/laiting/navigation/build/mapless_nav2
+running symlink_data
+creating /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/ament_index
+creating /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/ament_index/resource_index
+creating /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/ament_index/resource_index/packages
+symbolically linking /home/david/Desktop/laiting/navigation/build/mapless_nav2/resource/mapless_nav2 -> /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/ament_index/resource_index/packages
+symbolically linking /home/david/Desktop/laiting/navigation/build/mapless_nav2/package.xml -> /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/mapless_nav2
+creating /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/mapless_nav2/launch
+symbolically linking /home/david/Desktop/laiting/navigation/build/mapless_nav2/launch/mapless_tb3_sim.launch.py -> /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/mapless_nav2/launch
+creating /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/mapless_nav2/config
+symbolically linking /home/david/Desktop/laiting/navigation/build/mapless_nav2/config/nav2_mapless_params.yaml -> /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/mapless_nav2/config
+creating /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/mapless_nav2/rviz
+symbolically linking /home/david/Desktop/laiting/navigation/build/mapless_nav2/rviz/mapless_nav2.rviz -> /home/david/Desktop/laiting/navigation/install/mapless_nav2/share/mapless_nav2/rviz

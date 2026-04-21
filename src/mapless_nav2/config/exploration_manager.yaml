@@ -1,0 +1,87 @@
+exploration_coordinator:
+  ros__parameters:
+    use_sim_time: True
+
+    map_topic: /map
+    goal_topic: /goal_pose
+    legacy_goal_topic: /mapless_goal
+    clicked_goal_topic: /clicked_point
+    robot_frame: base_footprint
+    global_frame: map
+
+    frontier_markers_topic: /exploration/frontier_markers
+    candidate_markers_topic: /exploration/candidate_markers
+    selected_marker_topic: /exploration/selected_target
+    final_goal_marker_topic: /exploration/final_goal_marker
+    robot_pose_marker_topic: /exploration/robot_pose_marker
+    rrt_tree_topic: /exploration/rrt_tree
+    selected_path_topic: /exploration/selected_path
+    state_topic: /exploration/state
+
+    loop_rate_hz: 1.5
+    replan_period_sec: 2.0
+    goal_reachability_recheck_sec: 2.0
+    goal_tolerance_m: 0.35
+    progress_min_delta_m: 0.12
+
+    free_threshold: 15
+    occupied_threshold: 65
+    inflation_radius_m: 0.14
+    goal_snap_radius_cells: 12
+    astar_revisit_cost_scale: 0.06
+
+    frontier_filter_min_distance: 0.35
+    frontier_filter_max_distance: 14.0
+    max_scored_candidates: 24
+
+    recovery_cooldown_sec: 3.0
+    max_frontier_failures_total: 80
+
+    frontier_min_cluster_size: 6
+    frontier_info_gain_radius_m: 1.1
+
+    rrt_iterations: 500
+    rrt_step_m: 0.25
+    rrt_goal_bias: 0.35
+    rrt_frontier_proximity_m: 0.60
+    rrt_goal_snap_radius_cells: 8
+
+    candidate_min_separation_m: 0.45
+    candidate_max_per_frontier: 3
+    robot_candidate_min_distance_m: 0.35
+
+    # Utility scoring weights
+    w_info: 1.4
+    w_cost: 1.15
+    w_visit: 0.7
+    w_fail: 1.0
+    w_turn: 0.35
+    w_goal: 0.5
+    w_commit: 0.45
+
+    # Anti-revisit / anti-wandering memory
+    visited_decay_tau: 120.0
+    visited_increment: 1.0
+    visited_prune_threshold: 0.03
+
+    frontier_cooldown_sec: 12.0
+    frontier_blacklist_base_sec: 25.0
+    frontier_blacklist_max_sec: 240.0
+    frontier_fail_blacklist_threshold: 2
+
+    commitment_horizon_sec: 10.0
+
+    stuck_window_sec: 12.0
+    stuck_radius_m: 0.22
+
+    oscillation_window_sec: 10.0
+    oscillation_cell_size_m: 0.20
+    oscillation_toggle_threshold: 4
+
+    stagnation_window_sec: 20.0
+    stagnation_min_known_delta: 40
+    stagnation_min_travel_m: 0.60
+
+    # Optional learned reranker (disabled baseline)
+    learned_ranker_enabled: False
+    learned_ranker_bias_gain: 0.05

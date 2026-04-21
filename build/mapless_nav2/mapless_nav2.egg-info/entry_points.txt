@@ -1,0 +1,7 @@
+[console_scripts]
+exploration_coordinator = mapless_nav2.exploration_coordinator:main
+mapless_goal_manager = mapless_nav2.mapless_goal_manager:main
+mapless_safety_controller = mapless_nav2.safety_controller:main
+mapless_scan_stabilizer = mapless_nav2.scan_stabilizer:main
+mapless_send_goal = mapless_nav2.send_goal:main
+

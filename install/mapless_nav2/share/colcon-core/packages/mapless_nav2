@@ -1,0 +1,1 @@
+gazebo_plugins:gazebo_ros:geometry_msgs:launch:launch_ros:nav2_behaviors:nav2_bringup:nav2_bt_navigator:nav2_msgs:nav2_regulated_pure_pursuit_controller:nav2_smac_planner:nav2_velocity_smoother:nav_msgs:rclpy:robot_state_publisher:rviz2:sensor_msgs:slam_toolbox:std_msgs:tf2_ros:tf_transformations:visualization_msgs
