@@ -1,0 +1,246 @@
+"""Environment logic for LiDAR-based goal navigation."""
+
+from __future__ import annotations
+
+from collections import deque
+from dataclasses import dataclass
+import math
+from typing import Deque, Optional, Tuple
+
+import numpy as np
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+
+
+@dataclass
+class StepResult:
+    """Container for one environment evaluation step."""
+
+    state: np.ndarray
+    reward: float
+    done: bool
+    reason: str
+    goal_distance: float
+    heading_angle: float
+    min_obstacle_distance: float
+
+
+class GoalSeekerEnvironment:
+    """Converts ROS sensor streams into RL state and reward signals."""
+
+    def __init__(
+        self,
+        lidar_samples: int = 24,
+        lidar_max_range: float = 3.5,
+        max_goal_distance: float = 10.0,
+        goal_tolerance: float = 0.20,
+        collision_distance: float = 0.13,
+        stuck_window_sec: float = 10.0,
+        stuck_cell_size: float = 0.10,
+        stuck_overlap_threshold: float = 0.70,
+        spin_filter_angular_threshold: float = 0.5,
+        spin_filter_min_range: float = 0.15,
+    ) -> None:
+        self.lidar_samples = lidar_samples
+        self.lidar_max_range = lidar_max_range
+        self.max_goal_distance = max_goal_distance
+        self.goal_tolerance = goal_tolerance
+        self.collision_distance = collision_distance
+
+        self.stuck_window_sec = stuck_window_sec
+        self.stuck_cell_size = stuck_cell_size
+        self.stuck_overlap_threshold = stuck_overlap_threshold
+
+        # FAR Planner-inspired anti-noise scan filtering.
+        self.spin_filter_angular_threshold = spin_filter_angular_threshold
+        self.spin_filter_min_range = spin_filter_min_range
+
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_yaw = 0.0
+        self.angular_velocity_z = 0.0
+        self.has_odom = False
+        self.has_scan = False
+
+        self.goal_xy: Optional[Tuple[float, float]] = None
+        self.previous_goal_distance: Optional[float] = None
+
+        self.scan_norm = np.ones(self.lidar_samples, dtype=np.float32)
+        self.min_obstacle_distance = self.lidar_max_range
+
+        self.position_history: Deque[Tuple[float, float, float]] = deque()
+        self.last_overlap_ratio = 0.0
+
+    @property
+    def state_dim(self) -> int:
+        """Return size of state vector: 24 LiDAR + distance + heading."""
+        return self.lidar_samples + 2
+
+    def set_goal(self, x: float, y: float, now_sec: float) -> None:
+        """Set a new goal and reset per-episode internal state."""
+        self.goal_xy = (x, y)
+        self.previous_goal_distance = None
+        self.position_history.clear()
+        self.position_history.append((now_sec, self.robot_x, self.robot_y))
+        self.last_overlap_ratio = 0.0
+
+    def clear_goal(self) -> None:
+        """Clear active goal."""
+        self.goal_xy = None
+        self.previous_goal_distance = None
+
+    def ready_for_control(self) -> bool:
+        """Check whether sensor data and goal are available."""
+        return self.has_odom and self.has_scan and self.goal_xy is not None
+
+    def register_reset(self, now_sec: float) -> None:
+        """Reset episode-only memory after simulation reset."""
+        self.previous_goal_distance = None
+        self.position_history.clear()
+        self.position_history.append((now_sec, self.robot_x, self.robot_y))
+        self.last_overlap_ratio = 0.0
+
+    def update_odom(self, msg: Odometry, now_sec: float) -> None:
+        """Update robot pose and motion state from odometry."""
+        self.robot_x = float(msg.pose.pose.position.x)
+        self.robot_y = float(msg.pose.pose.position.y)
+        self.robot_yaw = self._yaw_from_quaternion(
+            float(msg.pose.pose.orientation.x),
+            float(msg.pose.pose.orientation.y),
+            float(msg.pose.pose.orientation.z),
+            float(msg.pose.pose.orientation.w),
+        )
+        self.angular_velocity_z = float(msg.twist.twist.angular.z)
+        self.has_odom = True
+
+        self.position_history.append((now_sec, self.robot_x, self.robot_y))
+        self._trim_history(now_sec)
+
+    def update_scan(self, msg: LaserScan) -> None:
+        """Update normalized LiDAR state and minimum obstacle distance."""
+        if not msg.ranges:
+            return
+
+        ranges = np.asarray(msg.ranges, dtype=np.float32)
+        valid_fill = min(float(msg.range_max), self.lidar_max_range)
+        ranges = np.nan_to_num(ranges, nan=valid_fill, posinf=valid_fill, neginf=valid_fill)
+        ranges = np.clip(ranges, float(msg.range_min), self.lidar_max_range)
+
+        if abs(self.angular_velocity_z) > self.spin_filter_angular_threshold:
+            # Ignore very short rays while spinning to reduce floor artifacts.
+            ranges = np.where(ranges < self.spin_filter_min_range, self.lidar_max_range, ranges)
+
+        idx = np.linspace(0, len(ranges) - 1, self.lidar_samples, dtype=np.int32)
+        sampled = ranges[idx]
+
+        self.scan_norm = np.clip(sampled / self.lidar_max_range, 0.0, 1.0).astype(np.float32)
+        self.min_obstacle_distance = float(np.min(sampled))
+        self.has_scan = True
+
+    def compute_state(self) -> np.ndarray:
+        """Build state vector from LiDAR + relative goal polar coordinates."""
+        goal_distance, heading = self._goal_metrics()
+        distance_norm = float(np.clip(goal_distance / self.max_goal_distance, 0.0, 1.0))
+        heading_norm = float(np.clip(heading / math.pi, -1.0, 1.0))
+        return np.concatenate([self.scan_norm, np.array([distance_norm, heading_norm], dtype=np.float32)])
+
+    def evaluate_step(self, now_sec: float) -> StepResult:
+        """Evaluate reward and termination flags for the current observation."""
+        self._trim_history(now_sec)
+        state = self.compute_state()
+        goal_distance, heading = self._goal_metrics()
+
+        if self.goal_xy is None:
+            return StepResult(
+                state=state,
+                reward=0.0,
+                done=False,
+                reason="idle",
+                goal_distance=goal_distance,
+                heading_angle=heading,
+                min_obstacle_distance=self.min_obstacle_distance,
+            )
+
+        reward = 0.0
+        done = False
+        reason = "running"
+
+        # Approach bonus: +100 * (D_{t-1} - D_t), only when moving closer.
+        if self.previous_goal_distance is not None and goal_distance < self.previous_goal_distance:
+            reward += 100.0 * (self.previous_goal_distance - goal_distance)
+
+        if goal_distance <= self.goal_tolerance:
+            reward += 1000.0
+            done = True
+            reason = "goal"
+        elif self.min_obstacle_distance <= self.collision_distance:
+            reward -= 500.0
+            done = True
+            reason = "collision"
+        else:
+            self.last_overlap_ratio = self._compute_overlap_ratio()
+            if self.last_overlap_ratio >= self.stuck_overlap_threshold:
+                reward -= 10.0
+                done = True
+                reason = "stuck"
+
+        self.previous_goal_distance = goal_distance
+
+        return StepResult(
+            state=state,
+            reward=reward,
+            done=done,
+            reason=reason,
+            goal_distance=goal_distance,
+            heading_angle=heading,
+            min_obstacle_distance=self.min_obstacle_distance,
+        )
+
+    def _goal_metrics(self) -> tuple[float, float]:
+        """Return distance and relative heading to active goal."""
+        if self.goal_xy is None:
+            return self.max_goal_distance, 0.0
+
+        dx = self.goal_xy[0] - self.robot_x
+        dy = self.goal_xy[1] - self.robot_y
+        distance = math.sqrt(dx * dx + dy * dy)
+        heading = math.atan2(dy, dx) - self.robot_yaw
+
+        while heading > math.pi:
+            heading -= 2.0 * math.pi
+        while heading < -math.pi:
+            heading += 2.0 * math.pi
+        return distance, heading
+
+    def _trim_history(self, now_sec: float) -> None:
+        """Keep only recent position samples within the configured time window."""
+        min_time = now_sec - self.stuck_window_sec
+        while self.position_history and self.position_history[0][0] < min_time:
+            self.position_history.popleft()
+
+    def _compute_overlap_ratio(self) -> float:
+        """Compute overlap ratio of recent trajectory positions."""
+        if len(self.position_history) < 10:
+            return 0.0
+
+        history_duration = self.position_history[-1][0] - self.position_history[0][0]
+        if history_duration < self.stuck_window_sec * 0.7:
+            return 0.0
+
+        cells = [
+            (
+                int(round(x / self.stuck_cell_size)),
+                int(round(y / self.stuck_cell_size)),
+            )
+            for (_, x, y) in self.position_history
+        ]
+        unique_cells = len(set(cells))
+        return 1.0 - (unique_cells / float(len(cells)))
+
+    @staticmethod
+    def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
+        """Convert quaternion to yaw angle in radians."""
+        siny_cosp = 2.0 * (w * z + x * y)
+        cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+        return math.atan2(siny_cosp, cosy_cosp)
+
