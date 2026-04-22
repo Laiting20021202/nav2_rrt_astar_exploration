@@ -80,6 +80,7 @@ class ScanStabilizer(Node):
         self.last_warn_sec = 0.0
         self.current_yaw_rate = 0.0
         self.last_stable_scan: Optional[LaserScan] = None
+        self.last_scan_stamp_sec: Optional[float] = None
 
         self.get_logger().info(
             "Scan stabilizer enabled: in=%s out=%s max_roll=%.1fdeg max_pitch=%.1fdeg max_yaw_rate=%.1fdeg/s max_yaw_delta=%.1fdeg"
@@ -100,12 +101,14 @@ class ScanStabilizer(Node):
         self.current_yaw_rate = float(msg.twist.twist.angular.z)
 
     def scan_callback(self, msg: LaserScan) -> None:
+        stamp_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
         sensor_frame = msg.header.frame_id.strip() if msg.header.frame_id else self.base_frame
         tilt = self.lookup_tilt(sensor_frame)
         if tilt is None:
             # If TF is temporarily unavailable, do not drop scan data.
             self.scan_pub.publish(msg)
             self.tilt_status_pub.publish(Bool(data=False))
+            self.last_scan_stamp_sec = stamp_sec
             return
 
         roll, pitch = tilt
@@ -114,12 +117,10 @@ class ScanStabilizer(Node):
         max_tilt = max(abs_roll, abs_pitch)
         yaw_rate = abs(self.current_yaw_rate)
         scan_duration = self.estimate_scan_duration(msg)
-        fast_turn = (
-            self.drop_scan_on_fast_turn
-            and yaw_rate > self.max_yaw_rate
-        ) or (
-            self.drop_scan_on_fast_turn
-            and (yaw_rate * scan_duration) > self.max_yaw_delta_per_scan
+        yaw_delta = yaw_rate * scan_duration
+        fast_turn = self.drop_scan_on_fast_turn and (
+            (scan_duration > 1.0e-3 and yaw_delta > self.max_yaw_delta_per_scan)
+            or yaw_rate > (1.8 * self.max_yaw_rate)
         )
 
         if self.tilt_blocked:
@@ -140,11 +141,13 @@ class ScanStabilizer(Node):
         if self.tilt_blocked:
             self.tilt_status_pub.publish(Bool(data=True))
             self.maybe_warn(roll, pitch, yaw_rate, scan_duration, fast_turn)
+            self.last_scan_stamp_sec = stamp_sec
             return
 
         self.scan_pub.publish(msg)
         self.tilt_status_pub.publish(Bool(data=False))
         self.last_stable_scan = copy.deepcopy(msg)
+        self.last_scan_stamp_sec = stamp_sec
 
     def make_suppressed_scan(self, msg: LaserScan) -> LaserScan:
         if self.last_stable_scan is not None:
@@ -165,6 +168,11 @@ class ScanStabilizer(Node):
             return float(msg.scan_time)
         if msg.time_increment > 1e-9 and msg.ranges:
             return float(msg.time_increment) * float(len(msg.ranges))
+        stamp_sec = float(msg.header.stamp.sec) + float(msg.header.stamp.nanosec) * 1e-9
+        if self.last_scan_stamp_sec is not None:
+            dt = stamp_sec - self.last_scan_stamp_sec
+            if 1.0e-3 < dt < 0.5:
+                return dt
         return 0.0
 
     def maybe_warn(

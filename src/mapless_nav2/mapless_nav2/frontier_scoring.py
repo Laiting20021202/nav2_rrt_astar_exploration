@@ -11,14 +11,6 @@ class FrontierScorer:
     def __init__(self, params: Dict[str, float]) -> None:
         self.w_info = float(params.get("w_info", 1.4))
         self.w_cost = float(params.get("w_cost", 1.1))
-        self.w_visit = float(params.get("w_visit", 0.7))
-        self.w_fail = float(params.get("w_fail", 1.0))
-        self.w_turn = float(params.get("w_turn", 0.35))
-        self.w_goal = float(params.get("w_goal", 0.45))
-        self.w_commit = float(params.get("w_commit", 0.4))
-
-        self.max_revisit_penalty = max(0.1, float(params.get("max_revisit_penalty", 6.0)))
-        self.max_fail_penalty = max(0.1, float(params.get("max_fail_penalty", 8.0)))
 
     def score_candidates(
         self,
@@ -37,22 +29,9 @@ class FrontierScorer:
         for c in candidates:
             info_norm = c.information_gain / max_info
             cost_norm = min(1.0, c.path_cost / max_cost)
-
-            visit_norm = min(1.0, c.revisit_penalty / self.max_revisit_penalty)
-            fail_norm = min(1.0, c.failed_penalty / self.max_fail_penalty)
-            turn_norm = max(0.0, min(1.0, c.heading_penalty))
-
-            goal_bonus_norm = max(0.0, min(1.0, c.goal_alignment_bonus))
-            commit_norm = max(0.0, min(1.0, c.commitment_bonus))
-
             c.score = (
                 +self.w_info * info_norm
                 -self.w_cost * cost_norm
-                -self.w_visit * visit_norm
-                -self.w_fail * fail_norm
-                -self.w_turn * turn_norm
-                +self.w_goal * goal_bonus_norm
-                +self.w_commit * commit_norm
             )
 
         candidates.sort(key=lambda x: x.score, reverse=True)

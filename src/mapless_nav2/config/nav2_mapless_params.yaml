@@ -1,7 +1,7 @@
 bt_navigator:
   ros__parameters:
     use_sim_time: True
-    global_frame: odom
+    global_frame: map
     robot_base_frame: base_footprint
     odom_topic: /odom
     bt_loop_duration: 10
@@ -79,7 +79,7 @@ controller_server:
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
       required_movement_radius: 0.04
-      movement_time_allowance: 8.0
+      movement_time_allowance: 15.0
 
     general_goal_checker:
       stateful: True
@@ -94,19 +94,19 @@ controller_server:
       min_vel_y: 0.0
       max_vel_x: 0.14
       max_vel_y: 0.0
-      max_vel_theta: 0.22
+      max_vel_theta: 0.14
       min_speed_xy: 0.0
       max_speed_xy: 0.14
       min_speed_theta: 0.0
       acc_lim_x: 0.45
       acc_lim_y: 0.0
-      acc_lim_theta: 0.4
+      acc_lim_theta: 0.22
       decel_lim_x: -0.8
       decel_lim_y: 0.0
-      decel_lim_theta: -0.4
+      decel_lim_theta: -0.22
       vx_samples: 24
       vy_samples: 1
-      vtheta_samples: 10
+      vtheta_samples: 8
       sim_time: 0.7
       linear_granularity: 0.05
       angular_granularity: 0.025
@@ -176,17 +176,21 @@ global_costmap:
     ros__parameters:
       update_frequency: 3.0
       publish_frequency: 2.0
-      global_frame: odom
+      global_frame: map
       robot_base_frame: base_footprint
       use_sim_time: True
-      rolling_window: true
+      rolling_window: false
       width: 12
       height: 12
       resolution: 0.05
       robot_radius: 0.11
       footprint_padding: 0.0
       track_unknown_space: true
-      plugins: ["obstacle_layer", "inflation_layer"]
+      plugins: ["static_layer", "obstacle_layer", "inflation_layer"]
+      static_layer:
+        plugin: "nav2_costmap_2d::StaticLayer"
+        map_subscribe_transient_local: True
+        subscribe_to_updates: True
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
@@ -225,7 +229,7 @@ planner_server:
       plugin: "nav2_navfn_planner/NavfnPlanner"
       tolerance: 0.3
       use_astar: true
-      allow_unknown: true
+      allow_unknown: false
 
 smoother_server:
   ros__parameters:
@@ -252,13 +256,13 @@ behavior_server:
       plugin: "nav2_behaviors/DriveOnHeading"
     wait:
       plugin: "nav2_behaviors/Wait"
-    global_frame: odom
+    global_frame: map
     robot_base_frame: base_footprint
     transform_tolerance: 0.2
     simulate_ahead_time: 2.0
-    max_rotational_vel: 0.22
+    max_rotational_vel: 0.14
     min_rotational_vel: 0.04
-    rotational_acc_lim: 0.3
+    rotational_acc_lim: 0.20
 
 waypoint_follower:
   ros__parameters:
@@ -277,10 +281,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.14, 0.0, 0.22]
-    min_velocity: [0.0, 0.0, -0.22]
-    max_accel: [0.45, 0.0, 0.3]
-    max_decel: [-0.7, 0.0, -0.3]
+    max_velocity: [0.14, 0.0, 0.14]
+    min_velocity: [0.0, 0.0, -0.14]
+    max_accel: [0.45, 0.0, 0.20]
+    max_decel: [-0.7, 0.0, -0.20]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

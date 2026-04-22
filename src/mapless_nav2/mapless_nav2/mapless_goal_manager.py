@@ -9,7 +9,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 
 import rclpy
 from action_msgs.msg import GoalStatus
-from geometry_msgs.msg import Point, PoseStamped, Quaternion
+from geometry_msgs.msg import Point, PointStamped, PoseStamped, Quaternion
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid, Path
 from rclpy.action import ActionClient
@@ -76,6 +76,7 @@ class MaplessGoalManager(Node):
 
         self.declare_parameter("goal_topic", "/mapless_goal")
         self.declare_parameter("rviz_goal_topic", "/goal_pose")
+        self.declare_parameter("clicked_point_topic", "/clicked_point")
         self.declare_parameter("active_subgoal_topic", "/mapless_active_subgoal")
         self.declare_parameter("goal_reached_topic", "/mapless_goal_reached")
         self.declare_parameter("safety_status_topic", "/mapless_safety_active")
@@ -114,6 +115,10 @@ class MaplessGoalManager(Node):
         self.declare_parameter("escape_min_clearance", 0.35)
         self.declare_parameter("escape_goal_bias", 0.45)
         self.declare_parameter("escape_open_bias", 1.0)
+        self.declare_parameter("scan_spin_enabled", True)
+        self.declare_parameter("scan_spin_angle_deg", 100.0)
+        self.declare_parameter("scan_spin_cooldown_sec", 5.0)
+        self.declare_parameter("scan_spin_commit_sec", 2.8)
         self.declare_parameter("dead_end_memory_sec", 90.0)
         self.declare_parameter("dead_end_radius", 1.05)
         self.declare_parameter("dead_end_merge_dist", 0.45)
@@ -175,6 +180,7 @@ class MaplessGoalManager(Node):
 
         self.goal_topic = str(self.get_parameter("goal_topic").value)
         self.rviz_goal_topic = str(self.get_parameter("rviz_goal_topic").value)
+        self.clicked_point_topic = str(self.get_parameter("clicked_point_topic").value)
         self.active_subgoal_topic = str(self.get_parameter("active_subgoal_topic").value)
         self.goal_reached_topic = str(self.get_parameter("goal_reached_topic").value)
         self.safety_status_topic = str(self.get_parameter("safety_status_topic").value)
@@ -219,6 +225,10 @@ class MaplessGoalManager(Node):
         self.escape_min_clearance = float(self.get_parameter("escape_min_clearance").value)
         self.escape_goal_bias = float(self.get_parameter("escape_goal_bias").value)
         self.escape_open_bias = float(self.get_parameter("escape_open_bias").value)
+        self.scan_spin_enabled = bool(self.get_parameter("scan_spin_enabled").value)
+        self.scan_spin_angle = math.radians(float(self.get_parameter("scan_spin_angle_deg").value))
+        self.scan_spin_cooldown_sec = max(0.0, float(self.get_parameter("scan_spin_cooldown_sec").value))
+        self.scan_spin_commit_sec = max(0.5, float(self.get_parameter("scan_spin_commit_sec").value))
         self.dead_end_memory_sec = float(self.get_parameter("dead_end_memory_sec").value)
         self.dead_end_radius = float(self.get_parameter("dead_end_radius").value)
         self.dead_end_merge_dist = float(self.get_parameter("dead_end_merge_dist").value)
@@ -299,6 +309,9 @@ class MaplessGoalManager(Node):
             self.rviz_goal_sub = self.create_subscription(PoseStamped, self.rviz_goal_topic, self.goal_callback, 10)
         else:
             self.rviz_goal_sub = None
+        self.clicked_point_sub = self.create_subscription(
+            PointStamped, self.clicked_point_topic, self.clicked_point_callback, 10
+        )
         self.scan_sub = self.create_subscription(LaserScan, self.scan_topic, self.scan_callback, 10)
         self.safety_sub = self.create_subscription(Bool, self.safety_status_topic, self.safety_callback, 10)
         self.tilt_sub = self.create_subscription(Bool, self.tilt_status_topic, self.tilt_callback, 10)
@@ -363,6 +376,8 @@ class MaplessGoalManager(Node):
         self.mission_memory_dirty = False
         self.last_memory_cloud_pub_time = now
         self.last_tilt_purge_time = now
+        self.last_scan_spin_time = now - Duration(seconds=self.scan_spin_cooldown_sec)
+        self.scan_spin_direction = 1
 
         self.get_logger().info(
             "Mapless planner ready: profile=%s grid=%s horizon=%.2f rrt_iters=%d dead_end_mem=%.0fs breadcrumb=%.2fm"
@@ -422,6 +437,15 @@ class MaplessGoalManager(Node):
             "Received final goal at (%.2f, %.2f), src_frame='%s' planned_frame='%s'."
             % (goal.pose.position.x, goal.pose.position.y, src_frame, goal.header.frame_id)
         )
+
+    def clicked_point_callback(self, msg: PointStamped) -> None:
+        robot_pose = self.get_robot_pose(log_warning=False)
+        yaw = robot_pose.yaw if robot_pose is not None else 0.0
+        pose = PoseStamped()
+        pose.header = msg.header
+        pose.pose.position = msg.point
+        pose.pose.orientation = quaternion_from_yaw(yaw)
+        self.goal_callback(pose)
 
     def scan_callback(self, msg: LaserScan) -> None:
         if self.tilt_active:
@@ -550,7 +574,7 @@ class MaplessGoalManager(Node):
         if self.active_subgoal is not None:
             ax = self.active_subgoal.pose.position.x
             ay = self.active_subgoal.pose.position.y
-            reached_active = distance_xy(robot_pose.x, robot_pose.y, ax, ay) < max(0.25, 0.5 * self.subgoal_lookahead)
+            reached_active = self.is_subgoal_reached(self.active_subgoal, robot_pose)
             active_blocked = not self.segment_collision_free((robot_pose.x, robot_pose.y), (ax, ay), obstacles)
 
         no_progress = (now - self.last_progress_time) > Duration(seconds=self.progress_timeout)
@@ -571,12 +595,17 @@ class MaplessGoalManager(Node):
         dead_end_invalid = self.current_plan is not None and self.path_runs_into_dead_end(robot_pose, self.current_plan.path)
         in_plan_lock = now < self.plan_lock_until
 
-        if (trapped or blocked_persistent or (front_blocked and active_blocked)) and not in_escape:
+        should_escape = (
+            (blocked_persistent and no_progress)
+            or (trapped and no_progress and self.current_plan is None)
+            or (self.consecutive_plan_failures >= 3)
+        )
+        if should_escape and not in_escape:
             self.start_escape_mode(
                 robot_pose,
                 front_blocked,
                 obstacles,
-                mark_blocked_branch=(blocked_persistent or (front_blocked and no_progress)),
+                mark_blocked_branch=(blocked_persistent or no_progress),
             )
             in_escape = now < self.escape_until and self.escape_goal is not None
 
@@ -708,7 +737,7 @@ class MaplessGoalManager(Node):
 
         ax = self.active_subgoal.pose.position.x
         ay = self.active_subgoal.pose.position.y
-        reached_active = distance_xy(robot_pose.x, robot_pose.y, ax, ay) < max(0.25, 0.5 * self.subgoal_lookahead)
+        reached_active = self.is_subgoal_reached(self.active_subgoal, robot_pose)
 
         new = subgoal.pose.position
         delta = distance_xy(ax, ay, new.x, new.y)
@@ -728,6 +757,9 @@ class MaplessGoalManager(Node):
         gx = subgoal.pose.position.x
         gy = subgoal.pose.position.y
         d = distance_xy(robot_pose.x, robot_pose.y, gx, gy)
+        yaw_err = abs(wrap_to_pi(yaw_from_quaternion(subgoal.pose.orientation) - robot_pose.yaw))
+        if d < max(0.02, 0.35 * self.subgoal_min_distance) and yaw_err > 0.45:
+            return False
         if d >= self.subgoal_min_distance:
             return False
 
@@ -738,6 +770,15 @@ class MaplessGoalManager(Node):
         fy = self.final_goal.pose.position.y
         dist_to_final = distance_xy(robot_pose.x, robot_pose.y, fx, fy)
         return dist_to_final > self.goal_tolerance * 1.6
+
+    def is_subgoal_reached(self, subgoal: PoseStamped, robot_pose: Pose2D) -> bool:
+        gx = subgoal.pose.position.x
+        gy = subgoal.pose.position.y
+        d = distance_xy(robot_pose.x, robot_pose.y, gx, gy)
+        yaw_err = abs(wrap_to_pi(yaw_from_quaternion(subgoal.pose.orientation) - robot_pose.yaw))
+        if d < max(0.02, 0.35 * self.subgoal_min_distance) and yaw_err > 0.45:
+            return False
+        return d < max(0.25, 0.5 * self.subgoal_lookahead)
 
     def cancel_active_navigation(self) -> None:
         if self.active_goal_handle is None:
@@ -756,8 +797,34 @@ class MaplessGoalManager(Node):
                 self.get_logger().warn("Waiting for nav2 action server '/navigate_to_pose'...")
                 return
 
+        robot_pose = self.get_robot_pose(log_warning=False)
+        dispatch_goal = subgoal
+        if robot_pose is not None:
+            start = (robot_pose.x, robot_pose.y)
+            raw_goal = (subgoal.pose.position.x, subgoal.pose.position.y)
+            if distance_xy(start[0], start[1], raw_goal[0], raw_goal[1]) > max(0.05, self.subgoal_min_distance * 0.5):
+                clamped = self.retreat_to_known_free(start, raw_goal)
+                if clamped is None:
+                    self.get_logger().warn(
+                        "Refuse subgoal outside known-free map: raw=(%.2f, %.2f)."
+                        % (raw_goal[0], raw_goal[1])
+                    )
+                    return
+                if distance_xy(clamped[0], clamped[1], raw_goal[0], raw_goal[1]) > 0.05:
+                    self.get_logger().info(
+                        "Clamp subgoal to known-free map: raw=(%.2f, %.2f) -> send=(%.2f, %.2f)."
+                        % (raw_goal[0], raw_goal[1], clamped[0], clamped[1])
+                    )
+                dispatch_goal = PoseStamped()
+                dispatch_goal.header = subgoal.header
+                dispatch_goal.pose = subgoal.pose
+                dispatch_goal.pose.position.x = float(clamped[0])
+                dispatch_goal.pose.position.y = float(clamped[1])
+
         goal_msg = NavigateToPose.Goal()
-        goal_msg.pose = subgoal
+        goal_msg.pose = dispatch_goal
+        goal_msg.pose.header.stamp.sec = 0
+        goal_msg.pose.header.stamp.nanosec = 0
 
         self.current_goal_token += 1
         current_token = self.current_goal_token
@@ -765,12 +832,14 @@ class MaplessGoalManager(Node):
         send_future = self.nav_to_pose_client.send_goal_async(goal_msg, feedback_callback=self.feedback_callback)
         send_future.add_done_callback(lambda fut, token=current_token: self.goal_response_callback(fut, token))
 
-        self.active_subgoal = subgoal
+        self.active_subgoal = dispatch_goal
         self.last_send_time = self.get_clock().now()
         self.last_subgoal_time = self.last_send_time
-        self.active_subgoal_pub.publish(subgoal)
+        self.active_subgoal_pub.publish(dispatch_goal)
 
-        self.get_logger().info("Dispatch RRT subgoal (%.2f, %.2f)." % (subgoal.pose.position.x, subgoal.pose.position.y))
+        self.get_logger().info(
+            "Dispatch RRT subgoal (%.2f, %.2f)." % (dispatch_goal.pose.position.x, dispatch_goal.pose.position.y)
+        )
 
     def goal_response_callback(self, future, token: int) -> None:
         if token != self.current_goal_token:
@@ -883,13 +952,25 @@ class MaplessGoalManager(Node):
         goal = self.clip_goal_to_horizon(start, (fx, fy), self.planning_horizon)
         start_goal_dist = distance_xy(start[0], start[1], goal[0], goal[1])
         start_ignore_radius = max(self.subgoal_min_distance, 0.9 * self.collision_clearance)
+        prefer_exploration = False
+        exploration_plan: Optional[RRTPlan] = None
+
+        if self.latest_local_costmap is not None:
+            goal_cell = self.world_to_grid(self.latest_local_costmap, goal[0], goal[1])
+            prefer_exploration = (
+                goal_cell is None
+                or self.grid_cell_blocked(self.latest_local_costmap, goal_cell)
+            )
 
         guided_plan = self.plan_grid_path(robot_pose, obstacles)
         if guided_plan is not None:
             return guided_plan
 
+        if prefer_exploration:
+            exploration_plan = self.plan_exploration_path(robot_pose, obstacles)
+
         direct_penalty = self.segment_dead_end_cost(start, goal, start)
-        if self.segment_collision_free(
+        if (not prefer_exploration) and self.segment_collision_free(
             start,
             goal,
             obstacles,
@@ -897,10 +978,6 @@ class MaplessGoalManager(Node):
             ignore_radius=start_ignore_radius,
         ) and direct_penalty <= self.dead_end_replan_cost:
             return RRTPlan(path=[start, goal], tree_edges=[(start, goal)])
-
-        exploration_plan = self.plan_exploration_path(robot_pose, obstacles)
-        if exploration_plan is not None:
-            return exploration_plan
 
         tree: List[RRTNode] = [RRTNode(x=start[0], y=start[1], parent=-1, cost=0.0)]
         tree_edges: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
@@ -987,7 +1064,22 @@ class MaplessGoalManager(Node):
                         goal_index = candidate_idx
 
         if goal_index < 0:
-            return self.plan_exploration_path(robot_pose, obstacles)
+            if exploration_plan is None:
+                exploration_plan = self.plan_exploration_path(robot_pose, obstacles)
+            if exploration_plan is not None:
+                if tree_edges:
+                    return RRTPlan(
+                        path=exploration_plan.path,
+                        tree_edges=tree_edges + exploration_plan.tree_edges,
+                    )
+                return exploration_plan
+            if best_frontier_idx >= 0:
+                partial_path = self.extract_path(tree, best_frontier_idx)
+                if len(partial_path) >= 3:
+                    partial_path = self.shortcut_path(partial_path, obstacles)
+                if len(partial_path) >= 2:
+                    return RRTPlan(path=partial_path, tree_edges=tree_edges)
+            return None
 
         path = self.extract_path(tree, goal_index)
         if len(path) >= 3:
@@ -1013,8 +1105,10 @@ class MaplessGoalManager(Node):
             return None
 
         start_cell = self.find_nearest_free_cell(costmap, start_cell, max_radius=2)
-        goal_cell = self.find_nearest_free_cell(costmap, goal_cell, max_radius=8)
-        if start_cell is None or goal_cell is None:
+        if start_cell is None:
+            return None
+
+        if self.grid_cell_blocked(costmap, goal_cell):
             return None
 
         open_heap: List[Tuple[float, float, Tuple[int, int]]] = []
@@ -1127,7 +1221,17 @@ class MaplessGoalManager(Node):
             if unknown_neighbors > 0 and path_m >= min_path_m:
                 goal_progress = start_goal_dist - distance_xy(current_world[0], current_world[1], fx, fy)
                 experience_penalty = self.point_experience_penalty(current_world[0], current_world[1], start_world)
-                score = 1.4 * float(unknown_neighbors) + 0.45 * goal_progress - 0.12 * path_m - experience_penalty
+                clearance = self.grid_frontier_clearance(costmap, current, max_radius=8) * resolution
+                min_clearance = max(self.collision_clearance * 1.2, 0.18)
+                if clearance < min_clearance:
+                    continue
+                score = (
+                    2.4 * float(unknown_neighbors)
+                    + 1.1 * clearance
+                    + 0.10 * goal_progress
+                    + 0.10 * path_m
+                    - 0.18 * experience_penalty
+                )
                 if score > best_score:
                     best_score = score
                     best_cell = current
@@ -1158,7 +1262,16 @@ class MaplessGoalManager(Node):
         width = int(msg.info.width)
         height = int(msg.info.height)
         total = 0
-        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        for dx, dy in (
+            (-1, 0),
+            (1, 0),
+            (0, -1),
+            (0, 1),
+            (-1, -1),
+            (-1, 1),
+            (1, -1),
+            (1, 1),
+        ):
             nx = cell[0] + dx
             ny = cell[1] + dy
             if nx < 0 or ny < 0 or nx >= width or ny >= height:
@@ -1169,6 +1282,34 @@ class MaplessGoalManager(Node):
             if int(msg.data[idx]) < 0:
                 total += 1
         return total
+
+    def grid_frontier_clearance(self, msg: OccupancyGrid, cell: Tuple[int, int], max_radius: int) -> int:
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        for radius in range(1, max_radius + 1):
+            x0 = max(0, cell[0] - radius)
+            x1 = min(width - 1, cell[0] + radius)
+            y0 = max(0, cell[1] - radius)
+            y1 = min(height - 1, cell[1] + radius)
+            blocked = False
+            for x in range(x0, x1 + 1):
+                for y in (y0, y1):
+                    if self.grid_cell_blocked(msg, (x, y)):
+                        blocked = True
+                        break
+                if blocked:
+                    break
+            if not blocked:
+                for y in range(y0 + 1, y1):
+                    for x in (x0, x1):
+                        if self.grid_cell_blocked(msg, (x, y)):
+                            blocked = True
+                            break
+                    if blocked:
+                        break
+            if blocked:
+                return max(1, radius - 1)
+        return max_radius
 
     def sample_point(self, start: Tuple[float, float], goal: Tuple[float, float]) -> Tuple[float, float]:
         candidate = goal
@@ -1315,8 +1456,6 @@ class MaplessGoalManager(Node):
         return seg_len * (acc / float(steps))
 
     def point_experience_penalty(self, x: float, y: float, start: Tuple[float, float]) -> float:
-        if not self.advanced_mode:
-            return 0.0
         key = self.memory_key(x, y, self.experience_resolution)
         revisit_count = float(self.path_visit_cells.get(key, 0))
         failed_count = float(self.failed_branch_cells.get(key, 0.0))
@@ -1470,6 +1609,83 @@ class MaplessGoalManager(Node):
         origin_y = float(info.origin.position.y)
         res = float(info.resolution)
         return (origin_x + (cell[0] + 0.5) * res, origin_y + (cell[1] + 0.5) * res)
+
+    @staticmethod
+    def clamp_world_to_map(msg: OccupancyGrid, x: float, y: float) -> Tuple[float, float]:
+        info = msg.info
+        res = max(float(info.resolution), 1e-6)
+        origin_x = float(info.origin.position.x)
+        origin_y = float(info.origin.position.y)
+        max_x = origin_x + max(1, int(info.width) - 1) * res
+        max_y = origin_y + max(1, int(info.height) - 1) * res
+        eps = 0.51 * res
+        clamped_x = min(max(x, origin_x + eps), max_x - eps)
+        clamped_y = min(max(y, origin_y + eps), max_y - eps)
+        return (clamped_x, clamped_y)
+
+    def point_is_known_free(self, x: float, y: float) -> bool:
+        msg = self.latest_local_costmap
+        if msg is None:
+            return True
+        cell = self.world_to_grid(msg, x, y)
+        if cell is None:
+            return False
+        return not self.grid_cell_blocked(msg, cell)
+
+    def snap_point_to_known_free(self, x: float, y: float, max_radius: int = 3) -> Optional[Tuple[float, float]]:
+        msg = self.latest_local_costmap
+        if msg is None:
+            return (x, y)
+        clamped_x, clamped_y = self.clamp_world_to_map(msg, x, y)
+        cell = self.world_to_grid(msg, clamped_x, clamped_y)
+        if cell is None:
+            return None
+        free_cell = self.find_nearest_free_cell(msg, cell, max_radius=max_radius)
+        if free_cell is None:
+            return None
+        return self.grid_to_world(msg, free_cell)
+
+    def retreat_to_known_free(
+        self,
+        start: Tuple[float, float],
+        goal: Tuple[float, float],
+    ) -> Optional[Tuple[float, float]]:
+        if self.latest_local_costmap is None:
+            return goal
+
+        msg = self.latest_local_costmap
+        goal_in_bounds = self.world_to_grid(msg, goal[0], goal[1]) is not None
+        if goal_in_bounds and self.point_is_known_free(goal[0], goal[1]):
+            snapped = self.snap_point_to_known_free(goal[0], goal[1], max_radius=4)
+            return snapped if snapped is not None else goal
+
+        clamped_goal = self.clamp_world_to_map(msg, goal[0], goal[1])
+        snapped_clamped = self.snap_point_to_known_free(clamped_goal[0], clamped_goal[1], max_radius=8)
+        if snapped_clamped is not None and distance_xy(start[0], start[1], snapped_clamped[0], snapped_clamped[1]) >= max(self.subgoal_min_distance, 0.20):
+            return snapped_clamped
+
+        seg_len = distance_xy(start[0], start[1], goal[0], goal[1])
+        if seg_len <= 1.0e-6:
+            return None
+
+        res = max(float(msg.info.resolution), 0.05)
+        steps = max(8, int(seg_len / res) + 1)
+        min_dist = max(self.subgoal_min_distance, 0.35)
+
+        for i in range(steps, -1, -1):
+            t = i / float(steps)
+            x = start[0] + t * (goal[0] - start[0])
+            y = start[1] + t * (goal[1] - start[1])
+            if distance_xy(start[0], start[1], x, y) < min_dist:
+                continue
+            x, y = self.clamp_world_to_map(msg, x, y)
+            if not self.point_is_known_free(x, y):
+                continue
+            snapped = self.snap_point_to_known_free(x, y, max_radius=6)
+            if snapped is not None and distance_xy(start[0], start[1], snapped[0], snapped[1]) >= min_dist:
+                return snapped
+
+        return None
 
     def grid_cell_blocked(self, msg: OccupancyGrid, cell: Tuple[int, int]) -> bool:
         idx = cell[1] * int(msg.info.width) + cell[0]
@@ -1653,7 +1869,11 @@ class MaplessGoalManager(Node):
             return self.make_pose(robot_pose.x, robot_pose.y, robot_pose.yaw)
 
         if len(aligned) == 2:
-            gx, gy = aligned[-1]
+            target = self.retreat_to_known_free((robot_pose.x, robot_pose.y), aligned[-1])
+            if target is None:
+                self.get_logger().warn("No known-free subgoal on direct path; keep replanning/exploring.")
+                return self.make_pose(robot_pose.x, robot_pose.y, robot_pose.yaw)
+            gx, gy = target
             gyaw = math.atan2(gy - robot_pose.y, gx - robot_pose.x)
             if self.final_goal is not None:
                 fx = self.final_goal.pose.position.x
@@ -1675,6 +1895,11 @@ class MaplessGoalManager(Node):
                 ratio = (lookahead - acc) / seg
                 gx = x0 + ratio * (x1 - x0)
                 gy = y0 + ratio * (y1 - y0)
+                target = self.retreat_to_known_free((robot_pose.x, robot_pose.y), (gx, gy))
+                if target is None:
+                    self.get_logger().warn("Lookahead point falls outside known-free map; retreating to replan.")
+                    break
+                gx, gy = target
 
                 if i < len(aligned) - 1:
                     nx, ny = aligned[i + 1]
@@ -1684,7 +1909,11 @@ class MaplessGoalManager(Node):
                 return self.make_pose(gx, gy, gyaw)
             acc += seg
 
-        gx, gy = aligned[-1]
+        target = self.retreat_to_known_free((robot_pose.x, robot_pose.y), aligned[-1])
+        if target is None:
+            self.get_logger().warn("Tail path target is outside known-free map; keep replanning/exploring.")
+            return self.make_pose(robot_pose.x, robot_pose.y, robot_pose.yaw)
+        gx, gy = target
         if self.final_goal is not None:
             fx = self.final_goal.pose.position.x
             fy = self.final_goal.pose.position.y
@@ -1920,8 +2149,11 @@ class MaplessGoalManager(Node):
         self.register_dead_end_zone(robot_pose, self.now_seconds())
         if mark_blocked_branch:
             self.register_blocked_branch_zones(robot_pose, self.now_seconds())
-        mode = "breadcrumb"
-        subgoal = self.compute_memory_escape_subgoal(robot_pose, obstacles)
+        mode = "scan_spin"
+        subgoal = self.compute_scan_spin_subgoal(robot_pose)
+        if subgoal is None:
+            mode = "breadcrumb"
+            subgoal = self.compute_memory_escape_subgoal(robot_pose, obstacles)
         if subgoal is None:
             mode = "scan"
             subgoal = self.compute_escape_subgoal(robot_pose, obstacles)
@@ -1930,7 +2162,12 @@ class MaplessGoalManager(Node):
 
         now = self.get_clock().now()
         self.escape_goal = subgoal
-        self.escape_until = now + Duration(seconds=self.escape_commit_sec)
+        if mode == "scan_spin":
+            self.escape_until = now + Duration(seconds=self.scan_spin_commit_sec)
+            self.last_scan_spin_time = now
+            self.scan_spin_direction *= -1
+        else:
+            self.escape_until = now + Duration(seconds=self.escape_commit_sec)
         self.escape_attempts += 1
         self.current_plan = None
         self.active_subgoal = None
@@ -1939,7 +2176,10 @@ class MaplessGoalManager(Node):
         self.front_blocked_since = None
         self.last_send_time = None
         self.last_progress_time = now
-        self.plan_lock_until = now + Duration(seconds=self.escape_commit_sec)
+        if mode == "scan_spin":
+            self.plan_lock_until = now + Duration(seconds=self.scan_spin_commit_sec)
+        else:
+            self.plan_lock_until = now + Duration(seconds=self.escape_commit_sec)
 
         self.get_logger().warn(
             "Trap detected%s, start %s escape #%d to (%.2f, %.2f)."
@@ -1951,6 +2191,15 @@ class MaplessGoalManager(Node):
                 subgoal.pose.position.y,
             )
         )
+
+    def compute_scan_spin_subgoal(self, robot_pose: Pose2D) -> Optional[PoseStamped]:
+        if not self.scan_spin_enabled:
+            return None
+        now = self.get_clock().now()
+        if (now - self.last_scan_spin_time) < Duration(seconds=self.scan_spin_cooldown_sec):
+            return None
+        goal_yaw = wrap_to_pi(robot_pose.yaw + self.scan_spin_direction * self.scan_spin_angle)
+        return self.make_pose(robot_pose.x, robot_pose.y, goal_yaw)
 
     def register_dead_end_zone(self, robot_pose: Pose2D, now_sec: float) -> None:
         if not self.advanced_mode:

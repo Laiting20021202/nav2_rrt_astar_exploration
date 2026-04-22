@@ -50,6 +50,9 @@ class FrontierExtractor:
         self.candidate_min_separation_m = max(0.05, float(params.get("candidate_min_separation_m", 0.45)))
         self.candidate_max_per_frontier = max(1, int(params.get("candidate_max_per_frontier", 3)))
         self.robot_candidate_min_distance_m = max(0.0, float(params.get("robot_candidate_min_distance_m", 0.6)))
+        self.candidate_inward_offset_m = max(0.0, float(params.get("candidate_inward_offset_m", 0.18)))
+        self.candidate_snap_radius_cells = max(1, int(params.get("candidate_snap_radius_cells", 6)))
+        self.candidate_clearance_max_m = max(0.1, float(params.get("candidate_clearance_max_m", 1.2)))
 
     def extract_frontier_clusters(
         self,
@@ -250,12 +253,18 @@ class FrontierExtractor:
             if euclidean(new_world, robot_world) < self.robot_candidate_min_distance_m:
                 continue
 
+            staged = self.stage_candidate(msg, new_cell, robot_world, inflated_mask)
+            if staged is None:
+                continue
+            staged_cell, staged_world = staged
+
             candidate = FrontierCandidate(
                 candidate_id=f"c_{best_frontier.cluster_id}_{candidate_count[best_frontier.cluster_id]}",
                 frontier_id=best_frontier.cluster_id,
-                world=new_world,
-                cell=new_cell,
+                world=staged_world,
+                cell=staged_cell,
                 information_gain=best_frontier.information_gain,
+                clearance_bonus=self.estimate_clearance(msg, staged_cell),
             )
             candidates.append(candidate)
             candidate_count[best_frontier.cluster_id] += 1
@@ -273,7 +282,10 @@ class FrontierExtractor:
             )
             if centroid is None:
                 continue
-            centroid_world = grid_to_world(msg, centroid)
+            staged = self.stage_candidate(msg, centroid, robot_world, inflated_mask)
+            if staged is None:
+                continue
+            centroid, centroid_world = staged
             if euclidean(centroid_world, robot_world) < self.robot_candidate_min_distance_m:
                 continue
             candidates.append(
@@ -283,6 +295,7 @@ class FrontierExtractor:
                     world=centroid_world,
                     cell=centroid,
                     information_gain=cluster.information_gain,
+                    clearance_bonus=self.estimate_clearance(msg, centroid),
                 )
             )
             candidate_count[cluster.cluster_id] += 1
@@ -312,3 +325,60 @@ class FrontierExtractor:
             if keep:
                 out.append(cand)
         return out
+
+    def stage_candidate(
+        self,
+        msg: OccupancyGrid,
+        cell: GridCell,
+        reference_world: Tuple[float, float],
+        inflated_mask: Sequence[bool],
+    ) -> Optional[Tuple[GridCell, Tuple[float, float]]]:
+        raw_world = grid_to_world(msg, cell)
+        dx = reference_world[0] - raw_world[0]
+        dy = reference_world[1] - raw_world[1]
+        norm = math.hypot(dx, dy)
+        if norm > 1e-6 and self.candidate_inward_offset_m > 0.0:
+            scale = min(self.candidate_inward_offset_m, norm) / norm
+            stage_world = (raw_world[0] + dx * scale, raw_world[1] + dy * scale)
+            stage_cell = world_to_grid(msg, stage_world[0], stage_world[1]) or cell
+        else:
+            stage_cell = cell
+
+        snapped = nearest_free_cell(
+            msg,
+            stage_cell,
+            inflated_mask,
+            self.free_threshold,
+            max_radius=self.candidate_snap_radius_cells,
+        )
+        if snapped is None:
+            return None
+        return (snapped, grid_to_world(msg, snapped))
+
+    def estimate_clearance(self, msg: OccupancyGrid, cell: GridCell) -> float:
+        width = int(msg.info.width)
+        height = int(msg.info.height)
+        max_radius_cells = max(1, int(round(self.candidate_clearance_max_m / max(msg.info.resolution, 1e-6))))
+        if not in_bounds(width, height, cell):
+            return 0.0
+
+        for radius in range(1, max_radius_cells + 1):
+            found = False
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    if max(abs(dx), abs(dy)) != radius:
+                        continue
+                    nb = (cell[0] + dx, cell[1] + dy)
+                    if not in_bounds(width, height, nb):
+                        found = True
+                        continue
+                    idx = grid_index(width, nb)
+                    if int(msg.data[idx]) >= self.occupied_threshold:
+                        found = True
+                        break
+                if found:
+                    break
+            if found:
+                return radius * float(msg.info.resolution)
+
+        return self.candidate_clearance_max_m

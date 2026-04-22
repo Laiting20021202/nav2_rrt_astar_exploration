@@ -2,7 +2,7 @@
 import heapq
 import math
 from collections import deque
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from nav_msgs.msg import OccupancyGrid
 
@@ -136,17 +136,22 @@ def build_inflated_obstacle_mask(
     msg: OccupancyGrid,
     occupied_threshold: int,
     inflation_radius_m: float,
+    ignore_occupied_cells: Optional[Set[GridCell]] = None,
 ) -> List[bool]:
     width = int(msg.info.width)
     height = int(msg.info.height)
     data = msg.data
     mask = [False] * (width * height)
+    ignored = ignore_occupied_cells or set()
 
     inflation_cells = int(math.ceil(inflation_radius_m / max(msg.info.resolution, 1e-6)))
     if inflation_cells <= 0:
         for y in range(height):
             for x in range(width):
                 idx = grid_index(width, (x, y))
+                if (x, y) in ignored:
+                    mask[idx] = False
+                    continue
                 mask[idx] = is_occupied(int(data[idx]), occupied_threshold)
         return mask
 
@@ -154,6 +159,8 @@ def build_inflated_obstacle_mask(
     for y in range(height):
         for x in range(width):
             idx = grid_index(width, (x, y))
+            if (x, y) in ignored:
+                continue
             if is_occupied(int(data[idx]), occupied_threshold):
                 occupied_cells.append((x, y))
 
@@ -213,6 +220,9 @@ def astar_path(
     allow_unknown: bool,
     revisit_heat: Optional[Dict[GridCell, float]] = None,
     revisit_cost_scale: float = 0.0,
+    soft_obstacle_cells: Optional[Dict[GridCell, float]] = None,
+    soft_obstacle_cost_scale: float = 0.0,
+    unknown_cost_scale: float = 0.0,
 ) -> Tuple[List[GridCell], float]:
     width = int(msg.info.width)
     height = int(msg.info.height)
@@ -222,13 +232,20 @@ def astar_path(
         return ([], float("inf"))
 
     def traversable(cell: GridCell) -> bool:
+        soft_weight = None
+        if soft_obstacle_cells is not None:
+            soft_weight = soft_obstacle_cells.get(cell)
+
         idx = grid_index(width, cell)
-        if inflated_mask[idx]:
+        if inflated_mask[idx] and soft_weight is None:
             return False
         value = int(data[idx])
         if is_unknown(value):
             return allow_unknown
-        return is_free(value, free_threshold)
+        if is_free(value, free_threshold):
+            return True
+        # Sensor transient cells can be traversed with extra cost.
+        return soft_weight is not None
 
     if not traversable(start) or not traversable(goal):
         return ([], float("inf"))
@@ -279,8 +296,16 @@ def astar_path(
             occupancy_term = 0.0
             if value >= 0:
                 occupancy_term = 0.2 * min(1.0, value / 100.0)
+            elif allow_unknown and unknown_cost_scale > 0.0:
+                occupancy_term = unknown_cost_scale
 
-            tentative = g_curr + step + occupancy_term + revisit_term
+            soft_term = 0.0
+            if soft_obstacle_cells is not None and soft_obstacle_cost_scale > 0.0:
+                soft_weight = soft_obstacle_cells.get(nb)
+                if soft_weight is not None:
+                    soft_term = soft_obstacle_cost_scale * max(0.0, min(1.0, soft_weight))
+
+            tentative = g_curr + step + occupancy_term + revisit_term + soft_term
             if tentative >= g.get(nb, float("inf")):
                 continue
 

@@ -22,22 +22,43 @@ exploration_coordinator:
     replan_period_sec: 2.0
     goal_reachability_recheck_sec: 2.0
     goal_tolerance_m: 0.35
-    progress_min_delta_m: 0.12
+    progress_min_delta_m: 0.04
 
     free_threshold: 15
     occupied_threshold: 65
     inflation_radius_m: 0.14
+    dynamic_inflation_enabled: False
+    dynamic_inflation_goal_dist_m: 2.0
+    dynamic_inflation_scale: 0.6
+    dynamic_inflation_min_radius_m: 0.06
+    slim_inflation_fallback_enabled: False
     goal_snap_radius_cells: 12
     astar_revisit_cost_scale: 0.06
+    decision_persistence_sec: 1.0
+    min_target_age_before_stuck_check_sec: 6.0
+    reset_motion_history_on_new_target: True
+    optimistic_unknown_cost_scale: 0.0
 
-    frontier_filter_min_distance: 0.35
+    maze_mode: False
+    maze_cell_size_m: 0.40
+    maze_search_depth_limit: 80
+    maze_dead_end_penalty: 2.0
+
+    # Sensor noise filter for transient pitch-induced occupancy speckles
+    noise_filter_enabled: True
+    noise_filter_transient_ttl_sec: 1.2
+    noise_filter_confirm_hits: 3
+    noise_filter_isolated_neighbor_max: 1
+    noise_filter_soft_cost_scale: 0.9
+
+    frontier_filter_min_distance: 0.60
     frontier_filter_max_distance: 14.0
     max_scored_candidates: 24
 
-    recovery_cooldown_sec: 3.0
-    max_frontier_failures_total: 80
+    recovery_cooldown_sec: 1.5
+    max_frontier_failures_total: 9999
 
-    frontier_min_cluster_size: 6
+    frontier_min_cluster_size: 3
     frontier_info_gain_radius_m: 1.1
 
     rrt_iterations: 500
@@ -46,41 +67,49 @@ exploration_coordinator:
     rrt_frontier_proximity_m: 0.60
     rrt_goal_snap_radius_cells: 8
 
-    candidate_min_separation_m: 0.45
+    candidate_min_separation_m: 0.60
     candidate_max_per_frontier: 3
-    robot_candidate_min_distance_m: 0.35
+    robot_candidate_min_distance_m: 0.60
+    candidate_inward_offset_m: 0.25
+    candidate_snap_radius_cells: 6
+    candidate_clearance_max_m: 1.2
 
     # Utility scoring weights
     w_info: 1.4
     w_cost: 1.15
-    w_visit: 0.7
-    w_fail: 1.0
-    w_turn: 0.35
-    w_goal: 0.5
-    w_commit: 0.45
+    w_visit: 0.0
+    w_fail: 0.0
+    w_turn: 0.0
+    w_goal: 0.0
+    w_commit: 0.0
+    w_clearance: 0.0
+    goal_gravity_range_m: 6.0
+    goal_gravity_exp_gain: 1.2
+    goal_gravity_max_multiplier: 3.5
+    info_near_goal_min_scale: 0.35
 
     # Anti-revisit / anti-wandering memory
     visited_decay_tau: 120.0
     visited_increment: 1.0
     visited_prune_threshold: 0.03
 
-    frontier_cooldown_sec: 12.0
-    frontier_blacklist_base_sec: 25.0
-    frontier_blacklist_max_sec: 240.0
-    frontier_fail_blacklist_threshold: 2
+    frontier_cooldown_sec: 0.0
+    frontier_blacklist_base_sec: 1.0
+    frontier_blacklist_max_sec: 1.0
+    frontier_fail_blacklist_threshold: 999
 
-    commitment_horizon_sec: 10.0
+    commitment_horizon_sec: 0.0
 
-    stuck_window_sec: 12.0
-    stuck_radius_m: 0.22
+    stuck_window_sec: 60.0
+    stuck_radius_m: 0.08
 
-    oscillation_window_sec: 10.0
+    oscillation_window_sec: 30.0
     oscillation_cell_size_m: 0.20
-    oscillation_toggle_threshold: 4
+    oscillation_toggle_threshold: 99
 
-    stagnation_window_sec: 20.0
+    stagnation_window_sec: 120.0
     stagnation_min_known_delta: 40
-    stagnation_min_travel_m: 0.60
+    stagnation_min_travel_m: 0.12
 
     # Optional learned reranker (disabled baseline)
     learned_ranker_enabled: False

@@ -97,6 +97,15 @@ class ExplorationMemory:
                 self.last_motion_pose = (pose.x, pose.y)
                 self.last_motion_stamp = now_sec
 
+    def reset_for_new_target(self, pose: Pose2D, now_sec: float, known_cell_count: int) -> None:
+        self._decay_visited(now_sec)
+        self.pose_history.clear()
+        self.pose_history.append(PoseSample(pose.x, pose.y, pose.yaw, now_sec))
+        self.last_motion_pose = (pose.x, pose.y)
+        self.last_motion_stamp = now_sec
+        self.last_information_gain_stamp = now_sec
+        self.best_known_cells = max(self.best_known_cells, known_cell_count)
+
     def mark_cell_visited(self, cell: GridCell, now_sec: float, amount: float = 1.0) -> None:
         self._decay_visited(now_sec)
         self.visited_heat[cell] = self.visited_heat.get(cell, 0.0) + amount * self.visited_increment
