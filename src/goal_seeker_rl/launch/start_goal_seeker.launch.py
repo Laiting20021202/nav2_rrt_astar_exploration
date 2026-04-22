@@ -18,6 +18,7 @@ def generate_launch_description() -> LaunchDescription:
     use_rviz = LaunchConfiguration("use_rviz")
     inference_mode = LaunchConfiguration("inference_mode")
     model_path = LaunchConfiguration("model_path")
+    checkpoint_dir = LaunchConfiguration("checkpoint_dir")
     world = LaunchConfiguration("world")
     rviz_config = LaunchConfiguration("rviz_config")
 
@@ -85,6 +86,7 @@ def generate_launch_description() -> LaunchDescription:
                 "use_sim_time": use_sim_time,
                 "inference_mode": inference_mode,
                 "model_path": model_path,
+                "checkpoint_dir": checkpoint_dir,
             }
         ],
     )
@@ -97,6 +99,10 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("use_rviz", default_value="true"),
             DeclareLaunchArgument("inference_mode", default_value="false"),
             DeclareLaunchArgument("model_path", default_value=""),
+            DeclareLaunchArgument(
+                "checkpoint_dir",
+                default_value="/home/david/Desktop/laiting/rl_base_navigation/src/goal_seeker_rl/model",
+            ),
             DeclareLaunchArgument("world", default_value=default_world),
             DeclareLaunchArgument("rviz_config", default_value=default_rviz),
             gzserver_launch,
@@ -107,4 +113,3 @@ def generate_launch_description() -> LaunchDescription:
             goal_seeker_main,
         ]
     )
-
