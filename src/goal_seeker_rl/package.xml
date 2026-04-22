@@ -3,7 +3,7 @@
   <name>goal_seeker_rl</name>
   <version>0.1.0</version>
   <description>TD3-based LiDAR-only goal navigation for TurtleBot3 Waffle in ROS 2 Humble.</description>
-  <maintainer email="david@localhost">david</maintainer>
+  <maintainer email="david@example.com">david</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_python</buildtool_depend>
@@ -24,7 +24,6 @@
   <exec_depend>joint_state_publisher</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>turtlebot3_gazebo</exec_depend>
-  <exec_depend>turtlebot3_description</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

@@ -17,6 +17,7 @@ setup(
         (f"share/{package_name}", ["package.xml"]),
         (f"share/{package_name}/launch", glob.glob(os.path.join("launch", "*.launch.py"))),
         (f"share/{package_name}/rviz", glob.glob(os.path.join("rviz", "*.rviz"))),
+        (f"share/{package_name}/urdf", glob.glob(os.path.join("urdf", "*.urdf"))),
     ],
     install_requires=["setuptools", "numpy", "torch"],
     zip_safe=True,

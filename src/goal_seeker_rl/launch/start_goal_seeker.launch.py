@@ -31,9 +31,7 @@ def generate_launch_description() -> LaunchDescription:
         ]
     )
     default_rviz = PathJoinSubstitution([FindPackageShare("goal_seeker_rl"), "rviz", "nav_config.rviz"])
-    robot_urdf = PathJoinSubstitution(
-        [FindPackageShare("turtlebot3_description"), "urdf", "turtlebot3_waffle.urdf"]
-    )
+    robot_urdf = PathJoinSubstitution([FindPackageShare("goal_seeker_rl"), "urdf", "turtlebot3_waffle_minimal.urdf"])
 
     gzserver_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
