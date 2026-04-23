@@ -52,6 +52,8 @@ class GoalSeekerMainNode(Node):
         self.linear_speed_max = float(self.get_parameter("linear_speed_max").value)
         self.reference_linear_speed_max = float(self.get_parameter("reference_linear_speed_max").value)
         self.angular_speed_max = float(self.get_parameter("angular_speed_max").value)
+        self.reference_angular_speed_max = float(self.get_parameter("reference_angular_speed_max").value)
+        self.inference_reset_on_stuck = bool(self.get_parameter("inference_reset_on_stuck").value)
         self.resume_model_path = str(self.get_parameter("resume_model_path").value)
         self.control_rate_hz = float(self.get_parameter("control_rate_hz").value)
         self.max_episode_steps = int(self.get_parameter("max_episode_steps").value)
@@ -179,7 +181,7 @@ class GoalSeekerMainNode(Node):
         self.declare_parameter("reset_service_name", "/reset_simulation")
 
         self.declare_parameter("lidar_max_range", 3.5)
-        self.declare_parameter("max_goal_distance", 10.0)
+        self.declare_parameter("max_goal_distance", 5.94)
         self.declare_parameter("goal_tolerance", 0.20)
         self.declare_parameter("collision_distance", 0.13)
         self.declare_parameter("stuck_cell_size", 0.10)
@@ -187,6 +189,8 @@ class GoalSeekerMainNode(Node):
         self.declare_parameter("linear_speed_max", 0.26)
         self.declare_parameter("reference_linear_speed_max", 0.22)
         self.declare_parameter("angular_speed_max", 1.0)
+        self.declare_parameter("reference_angular_speed_max", 2.0)
+        self.declare_parameter("inference_reset_on_stuck", False)
 
         self.declare_parameter("hidden_dim", 256)
         self.declare_parameter("batch_size", 128)
@@ -246,6 +250,10 @@ class GoalSeekerMainNode(Node):
             return
 
         result = self.environment.evaluate_step(now_sec)
+        if self.inference_mode and not self.inference_reset_on_stuck and result.reason == "stuck":
+            # Keep trying in inference instead of stopping too early.
+            result.done = False
+            result.reason = "running"
 
         # The result at tick t is treated as outcome of action from tick t-1.
         if self.last_state is not None and self.last_action is not None:
@@ -346,9 +354,9 @@ class GoalSeekerMainNode(Node):
         """Map normalized action to TurtleBot3 action space and publish."""
         action = np.clip(action_norm, -1.0, 1.0)
         linear_cap = self.reference_linear_speed_max if self.use_reference_policy else self.linear_speed_max
+        angular_cap = self.reference_angular_speed_max if self.use_reference_policy else self.angular_speed_max
         linear_x = float((action[0] + 1.0) * 0.5 * linear_cap)
-        angular_z = float(action[1] * self.angular_speed_max)
-        angular_z = float(np.clip(angular_z, -1.0, 1.0))
+        angular_z = float(np.clip(action[1] * angular_cap, -angular_cap, angular_cap))
 
         twist = Twist()
         twist.linear.x = linear_x
@@ -394,11 +402,14 @@ def main(args: Optional[list[str]] = None) -> None:
     node = GoalSeekerMainNode()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         if not node.inference_mode:
             node._maybe_save_checkpoint()
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

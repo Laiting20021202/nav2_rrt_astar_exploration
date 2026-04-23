@@ -130,7 +130,12 @@ class GoalSeekerEnvironment:
             # Ignore very short rays while spinning to reduce floor artifacts.
             ranges = np.where(ranges < self.spin_filter_min_range, self.lidar_max_range, ranges)
 
-        idx = np.linspace(0, len(ranges) - 1, self.lidar_samples, dtype=np.int32)
+        if len(ranges) >= self.lidar_samples and (len(ranges) % self.lidar_samples == 0):
+            # Match native scanner bins when divisible (e.g. 360 -> 40 uses stride=9).
+            stride = len(ranges) // self.lidar_samples
+            idx = np.arange(0, stride * self.lidar_samples, stride, dtype=np.int32)
+        else:
+            idx = np.linspace(0, len(ranges) - 1, self.lidar_samples, dtype=np.int32)
         sampled = ranges[idx]
 
         self.scan_norm = np.clip(sampled / self.lidar_max_range, 0.0, 1.0).astype(np.float32)
@@ -243,4 +248,3 @@ class GoalSeekerEnvironment:
         siny_cosp = 2.0 * (w * z + x * y)
         cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
         return math.atan2(siny_cosp, cosy_cosp)
-

@@ -45,6 +45,24 @@ Visualization Manager:
         Value: /scan
       Use Fixed Frame: true
       Value: true
+    - Alpha: 1
+      Arrow Length: 0.5
+      Axes Length: 0.25
+      Axes Radius: 0.02
+      Class: rviz_default_plugins/Pose
+      Color: 255; 64; 64
+      Enabled: true
+      Name: GoalPose
+      Shaft Length: 0.2
+      Shaft Radius: 0.03
+      Shape: Arrow
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /goal_pose
+      Value: true
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
