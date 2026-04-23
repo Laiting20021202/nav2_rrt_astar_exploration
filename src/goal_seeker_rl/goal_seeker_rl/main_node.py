@@ -14,9 +14,26 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty
 import torch
+import torch.nn as nn
 
 from .environment_node import GoalSeekerEnvironment, StepResult
 from .td3_agent import TD3Agent, TD3Config
+
+
+class ReferenceActorPolicy(nn.Module):
+    """Reference actor architecture used by turtlebot3_drlnav pretrained models."""
+
+    def __init__(self, state_dim: int, hidden_dim: int = 512, action_dim: int = 2) -> None:
+        super().__init__()
+        self.fa1 = nn.Linear(state_dim, hidden_dim)
+        self.fa2 = nn.Linear(hidden_dim, hidden_dim)
+        self.fa3 = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """Return normalized action in [-1, 1]."""
+        x = torch.relu(self.fa1(state))
+        x = torch.relu(self.fa2(x))
+        return torch.tanh(self.fa3(x))
 
 
 class GoalSeekerMainNode(Node):
@@ -27,7 +44,14 @@ class GoalSeekerMainNode(Node):
         self._declare_parameters()
 
         self.inference_mode = bool(self.get_parameter("inference_mode").value)
+        self.policy_source = str(self.get_parameter("policy_source").value)
         self.model_path = str(self.get_parameter("model_path").value)
+        self.reference_actor_path = str(self.get_parameter("reference_actor_path").value)
+        self.reference_state_scan_samples = int(self.get_parameter("reference_state_scan_samples").value)
+        self.reference_hidden_dim = int(self.get_parameter("reference_hidden_dim").value)
+        self.linear_speed_max = float(self.get_parameter("linear_speed_max").value)
+        self.reference_linear_speed_max = float(self.get_parameter("reference_linear_speed_max").value)
+        self.angular_speed_max = float(self.get_parameter("angular_speed_max").value)
         self.resume_model_path = str(self.get_parameter("resume_model_path").value)
         self.control_rate_hz = float(self.get_parameter("control_rate_hz").value)
         self.max_episode_steps = int(self.get_parameter("max_episode_steps").value)
@@ -42,8 +66,11 @@ class GoalSeekerMainNode(Node):
         self.goal_topic = str(self.get_parameter("goal_topic").value)
         self.reset_service_name = str(self.get_parameter("reset_service_name").value)
 
+        self.use_reference_policy = self.inference_mode and self.policy_source == "reference_actor"
+        lidar_samples = self.reference_state_scan_samples if self.use_reference_policy else 24
+
         self.environment = GoalSeekerEnvironment(
-            lidar_samples=24,
+            lidar_samples=lidar_samples,
             lidar_max_range=float(self.get_parameter("lidar_max_range").value),
             max_goal_distance=float(self.get_parameter("max_goal_distance").value),
             goal_tolerance=float(self.get_parameter("goal_tolerance").value),
@@ -57,35 +84,55 @@ class GoalSeekerMainNode(Node):
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.get_logger().info(f"Using device: {device}")
-        td3_cfg = TD3Config(
-            batch_size=int(self.get_parameter("batch_size").value),
-            replay_size=int(self.get_parameter("replay_size").value),
-            policy_noise=float(self.get_parameter("policy_noise").value),
-            noise_clip=float(self.get_parameter("noise_clip").value),
-            policy_delay=int(self.get_parameter("policy_delay").value),
-            exploration_std=float(self.get_parameter("exploration_std").value),
-            warmup_steps=self.warmup_steps,
-            hidden_dim=int(self.get_parameter("hidden_dim").value),
-            gamma=float(self.get_parameter("gamma").value),
-            tau=float(self.get_parameter("tau").value),
-            actor_lr=float(self.get_parameter("actor_lr").value),
-            critic_lr=float(self.get_parameter("critic_lr").value),
-        )
-        self.agent = TD3Agent(
-            state_dim=self.environment.state_dim,
-            action_dim=2,
-            device=device,
-            config=td3_cfg,
-        )
+        self.agent: Optional[TD3Agent] = None
+        self.reference_policy: Optional[ReferenceActorPolicy] = None
+        self.reference_prev_action = np.zeros(2, dtype=np.float32)
 
-        if self.inference_mode:
-            if not self.model_path:
-                raise RuntimeError("inference_mode=true requires a valid model_path.")
-            self.agent.load(self.model_path)
-            self.get_logger().info(f"Inference mode enabled. Loaded weights from: {self.model_path}")
-        elif self.resume_model_path:
-            self.agent.load(self.resume_model_path, strict=False)
-            self.get_logger().info(f"Training resumed from: {self.resume_model_path}")
+        if self.use_reference_policy:
+            reference_state_dim = self.environment.state_dim + 2  # append previous action (lin, ang)
+            self.reference_policy = ReferenceActorPolicy(
+                state_dim=reference_state_dim,
+                hidden_dim=self.reference_hidden_dim,
+            ).to(device)
+            if not self.reference_actor_path:
+                raise RuntimeError("policy_source=reference_actor requires reference_actor_path in inference_mode.")
+            state_dict = torch.load(self.reference_actor_path, map_location=device)
+            self.reference_policy.load_state_dict(state_dict, strict=True)
+            self.reference_policy.eval()
+            self.get_logger().info(
+                "Inference mode enabled with reference actor: "
+                f"{self.reference_actor_path} (state_dim={reference_state_dim})"
+            )
+        else:
+            td3_cfg = TD3Config(
+                batch_size=int(self.get_parameter("batch_size").value),
+                replay_size=int(self.get_parameter("replay_size").value),
+                policy_noise=float(self.get_parameter("policy_noise").value),
+                noise_clip=float(self.get_parameter("noise_clip").value),
+                policy_delay=int(self.get_parameter("policy_delay").value),
+                exploration_std=float(self.get_parameter("exploration_std").value),
+                warmup_steps=self.warmup_steps,
+                hidden_dim=int(self.get_parameter("hidden_dim").value),
+                gamma=float(self.get_parameter("gamma").value),
+                tau=float(self.get_parameter("tau").value),
+                actor_lr=float(self.get_parameter("actor_lr").value),
+                critic_lr=float(self.get_parameter("critic_lr").value),
+            )
+            self.agent = TD3Agent(
+                state_dim=self.environment.state_dim,
+                action_dim=2,
+                device=device,
+                config=td3_cfg,
+            )
+
+            if self.inference_mode:
+                if not self.model_path:
+                    raise RuntimeError("inference_mode=true requires a valid model_path.")
+                self.agent.load(self.model_path)
+                self.get_logger().info(f"Inference mode enabled. Loaded weights from: {self.model_path}")
+            elif self.resume_model_path:
+                self.agent.load(self.resume_model_path, strict=False)
+                self.get_logger().info(f"Training resumed from: {self.resume_model_path}")
 
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.create_subscription(LaserScan, self.scan_topic, self._scan_callback, 10)
@@ -112,7 +159,14 @@ class GoalSeekerMainNode(Node):
     def _declare_parameters(self) -> None:
         """Declare ROS parameters used by the main node."""
         self.declare_parameter("inference_mode", False)
+        self.declare_parameter("policy_source", "td3")
         self.declare_parameter("model_path", "")
+        self.declare_parameter(
+            "reference_actor_path",
+            "/home/david/Desktop/laiting/rl_base_navigation/reference/turtlebot3_drlnav/src/turtlebot3_drl/model/examples/ddpg_0_stage9/actor_stage9_episode8000.pt",
+        )
+        self.declare_parameter("reference_state_scan_samples", 40)
+        self.declare_parameter("reference_hidden_dim", 512)
         self.declare_parameter("resume_model_path", "")
         self.declare_parameter("control_rate_hz", 10.0)
         self.declare_parameter("max_episode_steps", 1500)
@@ -130,6 +184,9 @@ class GoalSeekerMainNode(Node):
         self.declare_parameter("collision_distance", 0.13)
         self.declare_parameter("stuck_cell_size", 0.10)
         self.declare_parameter("stuck_overlap_threshold", 0.70)
+        self.declare_parameter("linear_speed_max", 0.26)
+        self.declare_parameter("reference_linear_speed_max", 0.22)
+        self.declare_parameter("angular_speed_max", 1.0)
 
         self.declare_parameter("hidden_dim", 256)
         self.declare_parameter("batch_size", 128)
@@ -165,6 +222,7 @@ class GoalSeekerMainNode(Node):
         self.goal_active = True
         self.last_state = None
         self.last_action = None
+        self.reference_prev_action = np.zeros(2, dtype=np.float32)
         self.episode_steps = 0
         self.episode_reward = 0.0
         self.episode_index += 1
@@ -207,6 +265,8 @@ class GoalSeekerMainNode(Node):
     def _consume_transition(self, result: StepResult) -> None:
         """Store transition and optionally train the TD3 model."""
         if not self.inference_mode:
+            if self.agent is None:
+                return
             self.agent.store_transition(
                 state=self.last_state,
                 action=self.last_action,
@@ -242,6 +302,7 @@ class GoalSeekerMainNode(Node):
 
         self.last_state = None
         self.last_action = None
+        self.reference_prev_action = np.zeros(2, dtype=np.float32)
         self.episode_steps = 0
         self.episode_reward = 0.0
 
@@ -258,24 +319,42 @@ class GoalSeekerMainNode(Node):
 
     def _select_action(self, state: np.ndarray) -> np.ndarray:
         """Choose action according to mode and exploration phase."""
+        if self.use_reference_policy:
+            if self.reference_policy is None:
+                raise RuntimeError("Reference policy was not initialized.")
+            policy_input = np.concatenate([state.astype(np.float32), self.reference_prev_action], axis=0)
+            with torch.no_grad():
+                state_t = torch.as_tensor(policy_input, dtype=torch.float32, device=next(self.reference_policy.parameters()).device)
+                action = self.reference_policy(state_t.unsqueeze(0)).cpu().numpy()[0]
+            return np.clip(action, -1.0, 1.0).astype(np.float32)
+
         if self.inference_mode:
+            if self.agent is None:
+                raise RuntimeError("TD3 agent was not initialized.")
             return self.agent.select_action(state, explore=False)
 
         if self.total_steps < self.warmup_steps:
+            if self.agent is None:
+                raise RuntimeError("TD3 agent was not initialized.")
             return self.agent.sample_random_action()
 
+        if self.agent is None:
+            raise RuntimeError("TD3 agent was not initialized.")
         return self.agent.select_action(state, explore=True)
 
     def _publish_action(self, action_norm: np.ndarray) -> None:
         """Map normalized action to TurtleBot3 action space and publish."""
         action = np.clip(action_norm, -1.0, 1.0)
-        linear_x = float((action[0] + 1.0) * 0.5 * 0.26)  # [0, 0.26]
-        angular_z = float(action[1])  # [-1, 1]
+        linear_cap = self.reference_linear_speed_max if self.use_reference_policy else self.linear_speed_max
+        linear_x = float((action[0] + 1.0) * 0.5 * linear_cap)
+        angular_z = float(action[1] * self.angular_speed_max)
+        angular_z = float(np.clip(angular_z, -1.0, 1.0))
 
         twist = Twist()
         twist.linear.x = linear_x
         twist.angular.z = angular_z
         self.cmd_pub.publish(twist)
+        self.reference_prev_action = action.astype(np.float32)
 
     def _publish_stop(self) -> None:
         """Publish zero velocity command."""
@@ -324,4 +403,3 @@ def main(args: Optional[list[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -17,7 +17,10 @@ def generate_launch_description() -> LaunchDescription:
     headless = LaunchConfiguration("headless")
     use_rviz = LaunchConfiguration("use_rviz")
     inference_mode = LaunchConfiguration("inference_mode")
+    policy_source = LaunchConfiguration("policy_source")
     model_path = LaunchConfiguration("model_path")
+    reference_actor_path = LaunchConfiguration("reference_actor_path")
+    reference_state_scan_samples = LaunchConfiguration("reference_state_scan_samples")
     checkpoint_dir = LaunchConfiguration("checkpoint_dir")
     world = LaunchConfiguration("world")
     rviz_config = LaunchConfiguration("rviz_config")
@@ -26,7 +29,7 @@ def generate_launch_description() -> LaunchDescription:
         [
             FindPackageShare("turtlebot3_gazebo"),
             "worlds",
-            "turtlebot3_drl_stage1",
+            "turtlebot3_houses",
             "waffle.model",
         ]
     )
@@ -83,7 +86,10 @@ def generate_launch_description() -> LaunchDescription:
             {
                 "use_sim_time": use_sim_time,
                 "inference_mode": inference_mode,
+                "policy_source": policy_source,
                 "model_path": model_path,
+                "reference_actor_path": reference_actor_path,
+                "reference_state_scan_samples": reference_state_scan_samples,
                 "checkpoint_dir": checkpoint_dir,
             }
         ],
@@ -96,7 +102,13 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("headless", default_value="false"),
             DeclareLaunchArgument("use_rviz", default_value="true"),
             DeclareLaunchArgument("inference_mode", default_value="false"),
+            DeclareLaunchArgument("policy_source", default_value="td3"),
             DeclareLaunchArgument("model_path", default_value=""),
+            DeclareLaunchArgument(
+                "reference_actor_path",
+                default_value="/home/david/Desktop/laiting/rl_base_navigation/reference/turtlebot3_drlnav/src/turtlebot3_drl/model/examples/ddpg_0_stage9/actor_stage9_episode8000.pt",
+            ),
+            DeclareLaunchArgument("reference_state_scan_samples", default_value="40"),
             DeclareLaunchArgument(
                 "checkpoint_dir",
                 default_value="/home/david/Desktop/laiting/rl_base_navigation/src/goal_seeker_rl/model",

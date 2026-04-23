@@ -34,7 +34,7 @@ Visualization Manager:
     - Class: rviz_default_plugins/LaserScan
       Enabled: true
       Name: LaserScan
-      Queue Size: 10
+      Queue Size: 100
       Size (Pixels): 3
       Style: Flat Squares
       Topic:
@@ -48,7 +48,7 @@ Visualization Manager:
   Enabled: true
   Global Options:
     Background Color: 48; 48; 48
-    Fixed Frame: map
+    Fixed Frame: odom
     Frame Rate: 30
   Name: root
   Tools:
