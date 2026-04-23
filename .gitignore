@@ -2,5 +2,8 @@ build/
 install/
 log/
 reference/
+robot model/
+src/goal_seeker_rl/model/*.pth
+src/goal_seeker_rl/model/*.pt
 **/__pycache__/
 *.pyc
