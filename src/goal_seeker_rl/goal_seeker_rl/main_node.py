@@ -8,6 +8,7 @@ from typing import Optional
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
@@ -15,6 +16,7 @@ from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty
 import torch
 import torch.nn as nn
+from visualization_msgs.msg import Marker
 
 from .environment_node import GoalSeekerEnvironment, StepResult
 from .td3_agent import TD3Agent, TD3Config
@@ -61,12 +63,23 @@ class GoalSeekerMainNode(Node):
         self.checkpoint_dir = Path(str(self.get_parameter("checkpoint_dir").value))
         self.checkpoint_interval_steps = int(self.get_parameter("checkpoint_interval_steps").value)
         self.warmup_steps = int(self.get_parameter("warmup_steps").value)
+        self.reset_on_episode_end = bool(self.get_parameter("reset_on_episode_end").value)
+        self.auto_goal_training = bool(self.get_parameter("auto_goal_training").value)
+        self.auto_goal_min_radius = float(self.get_parameter("auto_goal_min_radius").value)
+        self.auto_goal_max_radius = float(self.get_parameter("auto_goal_max_radius").value)
+        self.auto_goal_max_abs_x = float(self.get_parameter("auto_goal_max_abs_x").value)
+        self.auto_goal_max_abs_y = float(self.get_parameter("auto_goal_max_abs_y").value)
+        self.random_seed = int(self.get_parameter("random_seed").value)
+        self.goal_marker_topic = str(self.get_parameter("goal_marker_topic").value)
+        self.goal_marker_frame = str(self.get_parameter("goal_marker_frame").value)
+        self.publish_goal_marker = bool(self.get_parameter("publish_goal_marker").value)
 
         self.scan_topic = str(self.get_parameter("scan_topic").value)
         self.odom_topic = str(self.get_parameter("odom_topic").value)
         self.cmd_vel_topic = str(self.get_parameter("cmd_vel_topic").value)
         self.goal_topic = str(self.get_parameter("goal_topic").value)
         self.reset_service_name = str(self.get_parameter("reset_service_name").value)
+        self._rng = np.random.default_rng(self.random_seed)
 
         self.use_reference_policy = self.inference_mode and self.policy_source == "reference_actor"
         lidar_samples = self.reference_state_scan_samples if self.use_reference_policy else 24
@@ -137,11 +150,16 @@ class GoalSeekerMainNode(Node):
                 self.get_logger().info(f"Training resumed from: {self.resume_model_path}")
 
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
-        self.create_subscription(LaserScan, self.scan_topic, self._scan_callback, 10)
+        self.create_subscription(LaserScan, self.scan_topic, self._scan_callback, qos_profile_sensor_data)
         self.create_subscription(Odometry, self.odom_topic, self._odom_callback, 10)
         self.create_subscription(PoseStamped, self.goal_topic, self._goal_callback, 10)
+        self.goal_marker_pub = (
+            self.create_publisher(Marker, self.goal_marker_topic, 1) if self.publish_goal_marker else None
+        )
 
-        self.reset_client = self.create_client(Empty, self.reset_service_name)
+        self.reset_client = None
+        if self.reset_service_name:
+            self.reset_client = self.create_client(Empty, self.reset_service_name)
         self.control_timer = self.create_timer(1.0 / self.control_rate_hz, self._control_loop)
 
         self.goal_active = False
@@ -207,6 +225,16 @@ class GoalSeekerMainNode(Node):
 
         self.declare_parameter("checkpoint_dir", "checkpoints")
         self.declare_parameter("checkpoint_interval_steps", 5000)
+        self.declare_parameter("reset_on_episode_end", True)
+        self.declare_parameter("auto_goal_training", False)
+        self.declare_parameter("auto_goal_min_radius", 0.8)
+        self.declare_parameter("auto_goal_max_radius", 3.5)
+        self.declare_parameter("auto_goal_max_abs_x", 8.0)
+        self.declare_parameter("auto_goal_max_abs_y", 8.0)
+        self.declare_parameter("random_seed", 42)
+        self.declare_parameter("goal_marker_topic", "/goal_marker")
+        self.declare_parameter("goal_marker_frame", "odom")
+        self.declare_parameter("publish_goal_marker", True)
 
     def _scan_callback(self, msg: LaserScan) -> None:
         """Forward scan messages to environment module."""
@@ -221,19 +249,7 @@ class GoalSeekerMainNode(Node):
         now_sec = self._now_sec()
         gx = float(msg.pose.position.x)
         gy = float(msg.pose.position.y)
-
-        self.environment.set_goal(gx, gy, now_sec)
-        self.goal_active = True
-        self.last_state = None
-        self.last_action = None
-        self.reference_prev_action = np.zeros(2, dtype=np.float32)
-        self.episode_steps = 0
-        self.episode_reward = 0.0
-        self.episode_index += 1
-
-        self.get_logger().info(
-            f"Goal #{self.episode_index} received from RViz: x={gx:.2f}, y={gy:.2f}. Navigation started."
-        )
+        self._activate_goal(gx, gy, now_sec, source="RViz")
 
     def _control_loop(self) -> None:
         """Main control/training/inference loop."""
@@ -244,7 +260,15 @@ class GoalSeekerMainNode(Node):
             return
 
         if not self.goal_active:
-            return
+            if (
+                self.auto_goal_training
+                and (not self.inference_mode)
+                and self.environment.has_odom
+                and self.environment.has_scan
+            ):
+                self._set_auto_goal(now_sec)
+            else:
+                return
 
         if not self.environment.ready_for_control():
             return
@@ -314,14 +338,16 @@ class GoalSeekerMainNode(Node):
         self.episode_steps = 0
         self.episode_reward = 0.0
 
+        self.goal_active = False
+        self.environment.clear_goal()
+
         if self.inference_mode:
-            self.goal_active = False
             return
 
-        if reason in {"stuck", "collision", "timeout", "goal"}:
+        self.environment.register_reset(self._now_sec())
+        if self.reset_on_episode_end and reason in {"stuck", "collision", "timeout", "goal"}:
             self._reset_simulation()
-            self.environment.register_reset(self._now_sec())
-            self.pause_until_sec = self._now_sec() + self.reset_pause_sec
+        self.pause_until_sec = self._now_sec() + self.reset_pause_sec
 
         self._maybe_save_checkpoint()
 
@@ -351,7 +377,7 @@ class GoalSeekerMainNode(Node):
         return self.agent.select_action(state, explore=True)
 
     def _publish_action(self, action_norm: np.ndarray) -> None:
-        """Map normalized action to TurtleBot3 action space and publish."""
+        """Map normalized action to robot velocity command and publish."""
         action = np.clip(action_norm, -1.0, 1.0)
         linear_cap = self.reference_linear_speed_max if self.use_reference_policy else self.linear_speed_max
         angular_cap = self.reference_angular_speed_max if self.use_reference_policy else self.angular_speed_max
@@ -370,10 +396,71 @@ class GoalSeekerMainNode(Node):
 
     def _reset_simulation(self) -> None:
         """Call Gazebo simulation reset service asynchronously."""
+        if not self.reset_service_name:
+            return
+        if self.reset_client is None:
+            return
         if not self.reset_client.wait_for_service(timeout_sec=0.2):
             self.get_logger().warn(f"Reset service unavailable: {self.reset_service_name}")
             return
         self.reset_client.call_async(Empty.Request())
+
+    def _activate_goal(self, gx: float, gy: float, now_sec: float, source: str) -> None:
+        """Apply a new goal and reset episode bookkeeping."""
+        self.environment.set_goal(gx, gy, now_sec)
+        self.goal_active = True
+        self.last_state = None
+        self.last_action = None
+        self.reference_prev_action = np.zeros(2, dtype=np.float32)
+        self.episode_steps = 0
+        self.episode_reward = 0.0
+        self.episode_index += 1
+        self._publish_goal_marker(gx, gy)
+        self.get_logger().info(
+            f"Goal #{self.episode_index} received from {source}: x={gx:.2f}, y={gy:.2f}. Navigation started."
+        )
+
+    def _set_auto_goal(self, now_sec: float) -> None:
+        """Sample a training goal around the robot when auto-goal mode is enabled."""
+        min_r = max(0.1, self.auto_goal_min_radius)
+        max_r = max(min_r, self.auto_goal_max_radius)
+        for _ in range(50):
+            radius = float(self._rng.uniform(min_r, max_r))
+            angle = float(self._rng.uniform(-np.pi, np.pi))
+            gx = float(self.environment.robot_x + radius * np.cos(angle))
+            gy = float(self.environment.robot_y + radius * np.sin(angle))
+            if abs(gx) <= self.auto_goal_max_abs_x and abs(gy) <= self.auto_goal_max_abs_y:
+                self._activate_goal(gx, gy, now_sec, source="auto curriculum")
+                return
+
+        # Fallback: clip into configured workspace bounds.
+        gx = float(np.clip(self.environment.robot_x + max_r, -self.auto_goal_max_abs_x, self.auto_goal_max_abs_x))
+        gy = float(np.clip(self.environment.robot_y, -self.auto_goal_max_abs_y, self.auto_goal_max_abs_y))
+        self._activate_goal(gx, gy, now_sec, source="auto fallback")
+
+    def _publish_goal_marker(self, gx: float, gy: float) -> None:
+        """Publish a marker so the active goal is always visible in RViz."""
+        if self.goal_marker_pub is None:
+            return
+        marker = Marker()
+        marker.header.frame_id = self.goal_marker_frame
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "goal_seeker"
+        marker.id = 0
+        marker.type = Marker.ARROW
+        marker.action = Marker.ADD
+        marker.pose.position.x = gx
+        marker.pose.position.y = gy
+        marker.pose.position.z = 0.05
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.45
+        marker.scale.y = 0.08
+        marker.scale.z = 0.08
+        marker.color.a = 0.95
+        marker.color.r = 1.0
+        marker.color.g = 0.25
+        marker.color.b = 0.2
+        self.goal_marker_pub.publish(marker)
 
     def _maybe_save_checkpoint(self) -> None:
         """Persist model periodically during training."""
