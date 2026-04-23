@@ -11,7 +11,7 @@ import torch
 import torch.nn.functional as f
 from torch import nn
 
-from .networks import Actor, Critic
+from .networks import Actor, Critic, ReferenceActor, ReferenceCritic
 
 
 @dataclass
@@ -30,6 +30,7 @@ class TD3Config:
     exploration_std: float = 0.1
     warmup_steps: int = 2_000
     hidden_dim: int = 256
+    network_variant: str = "default"
 
 
 class ReplayBuffer:
@@ -99,10 +100,16 @@ class TD3Agent:
         self.device = device if device is not None else torch.device("cpu")
         self.config = config if config is not None else TD3Config()
 
-        self.actor = Actor(state_dim, action_dim, self.config.hidden_dim).to(self.device)
-        self.actor_target = Actor(state_dim, action_dim, self.config.hidden_dim).to(self.device)
-        self.critic = Critic(state_dim, action_dim, self.config.hidden_dim).to(self.device)
-        self.critic_target = Critic(state_dim, action_dim, self.config.hidden_dim).to(self.device)
+        actor_cls = Actor
+        critic_cls = Critic
+        if self.config.network_variant == "reference":
+            actor_cls = ReferenceActor
+            critic_cls = ReferenceCritic
+
+        self.actor = actor_cls(state_dim, action_dim, self.config.hidden_dim).to(self.device)
+        self.actor_target = actor_cls(state_dim, action_dim, self.config.hidden_dim).to(self.device)
+        self.critic = critic_cls(state_dim, action_dim, self.config.hidden_dim).to(self.device)
+        self.critic_target = critic_cls(state_dim, action_dim, self.config.hidden_dim).to(self.device)
 
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.critic_target.load_state_dict(self.critic.state_dict())
@@ -212,14 +219,30 @@ class TD3Agent:
         self.critic.load_state_dict(payload["critic"], strict=strict)
         self.critic_target.load_state_dict(payload["critic_target"], strict=strict)
         if "actor_opt" in payload:
-            self.actor_opt.load_state_dict(payload["actor_opt"])
+            try:
+                self.actor_opt.load_state_dict(payload["actor_opt"])
+            except ValueError:
+                # Optimizer state can be incompatible across architecture changes.
+                pass
         if "critic_opt" in payload:
-            self.critic_opt.load_state_dict(payload["critic_opt"])
+            try:
+                self.critic_opt.load_state_dict(payload["critic_opt"])
+            except ValueError:
+                # Optimizer state can be incompatible across architecture changes.
+                pass
         self.total_it = int(payload.get("total_it", 0))
+
+    def load_actor(self, path: str, strict: bool = True) -> None:
+        """Load only actor weights and sync actor target."""
+        payload = torch.load(path, map_location=self.device)
+        actor_state = payload.get("actor") if isinstance(payload, dict) else None
+        if actor_state is None:
+            actor_state = payload
+        self.actor.load_state_dict(actor_state, strict=strict)
+        self.actor_target.load_state_dict(self.actor.state_dict(), strict=True)
 
     @staticmethod
     def _soft_update(target: nn.Module, source: nn.Module, tau: float) -> None:
         """Polyak averaging update."""
         for target_param, source_param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(target_param.data * (1.0 - tau) + source_param.data * tau)
-

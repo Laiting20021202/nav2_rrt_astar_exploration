@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import math
-from typing import Deque, Optional, Tuple
+from typing import Deque, Dict, Optional, Tuple
 
 import numpy as np
 from nav_msgs.msg import Odometry
@@ -38,8 +38,21 @@ class GoalSeekerEnvironment:
         stuck_window_sec: float = 10.0,
         stuck_cell_size: float = 0.10,
         stuck_overlap_threshold: float = 0.70,
+        stuck_min_displacement: float = 0.50,
         spin_filter_angular_threshold: float = 0.5,
         spin_filter_min_range: float = 0.15,
+        episodic_memory_enabled: bool = True,
+        memory_cell_size: float = 0.20,
+        memory_novelty_reward: float = 0.40,
+        memory_revisit_penalty: float = 0.80,
+        memory_revisit_saturation: int = 4,
+        dead_end_front_distance: float = 0.45,
+        dead_end_side_distance: float = 0.65,
+        dead_end_clearance_margin: float = 0.20,
+        dead_end_front_angle_deg: float = 30.0,
+        dead_end_side_min_angle_deg: float = 45.0,
+        dead_end_side_max_angle_deg: float = 140.0,
+        dead_end_revisit_gate: float = 0.5,
     ) -> None:
         self.lidar_samples = lidar_samples
         self.lidar_max_range = lidar_max_range
@@ -50,10 +63,23 @@ class GoalSeekerEnvironment:
         self.stuck_window_sec = stuck_window_sec
         self.stuck_cell_size = stuck_cell_size
         self.stuck_overlap_threshold = stuck_overlap_threshold
+        self.stuck_min_displacement = max(0.01, stuck_min_displacement)
 
         # FAR Planner-inspired anti-noise scan filtering.
         self.spin_filter_angular_threshold = spin_filter_angular_threshold
         self.spin_filter_min_range = spin_filter_min_range
+        self.episodic_memory_enabled = episodic_memory_enabled
+        self.memory_cell_size = max(0.05, memory_cell_size)
+        self.memory_novelty_reward = memory_novelty_reward
+        self.memory_revisit_penalty = memory_revisit_penalty
+        self.memory_revisit_saturation = max(1, memory_revisit_saturation)
+        self.dead_end_front_distance = dead_end_front_distance
+        self.dead_end_side_distance = dead_end_side_distance
+        self.dead_end_clearance_margin = dead_end_clearance_margin
+        self.dead_end_front_angle_rad = math.radians(dead_end_front_angle_deg)
+        self.dead_end_side_min_angle_rad = math.radians(dead_end_side_min_angle_deg)
+        self.dead_end_side_max_angle_rad = math.radians(dead_end_side_max_angle_deg)
+        self.dead_end_revisit_gate = dead_end_revisit_gate
 
         self.robot_x = 0.0
         self.robot_y = 0.0
@@ -66,10 +92,18 @@ class GoalSeekerEnvironment:
         self.previous_goal_distance: Optional[float] = None
 
         self.scan_norm = np.ones(self.lidar_samples, dtype=np.float32)
+        self.scan_sampled = np.full(self.lidar_samples, self.lidar_max_range, dtype=np.float32)
+        self.scan_angles = np.linspace(-math.pi, math.pi, self.lidar_samples, dtype=np.float32)
         self.min_obstacle_distance = self.lidar_max_range
 
         self.position_history: Deque[Tuple[float, float, float]] = deque()
         self.last_overlap_ratio = 0.0
+        self.visit_counts: Dict[Tuple[int, int], int] = {}
+        self.last_memory_cell: Optional[Tuple[int, int]] = None
+        self.last_revisit_ratio = 0.0
+        self.dead_end_detected = False
+        self.dead_end_turn_hint = 0.0
+        self.dead_end_intensity = 0.0
 
     @property
     def state_dim(self) -> int:
@@ -83,11 +117,13 @@ class GoalSeekerEnvironment:
         self.position_history.clear()
         self.position_history.append((now_sec, self.robot_x, self.robot_y))
         self.last_overlap_ratio = 0.0
+        self._reset_episodic_memory()
 
     def clear_goal(self) -> None:
         """Clear active goal."""
         self.goal_xy = None
         self.previous_goal_distance = None
+        self._reset_episodic_memory()
 
     def ready_for_control(self) -> bool:
         """Check whether sensor data and goal are available."""
@@ -99,6 +135,7 @@ class GoalSeekerEnvironment:
         self.position_history.clear()
         self.position_history.append((now_sec, self.robot_x, self.robot_y))
         self.last_overlap_ratio = 0.0
+        self._reset_episodic_memory()
 
     def update_odom(self, msg: Odometry, now_sec: float) -> None:
         """Update robot pose and motion state from odometry."""
@@ -137,9 +174,13 @@ class GoalSeekerEnvironment:
         else:
             idx = np.linspace(0, len(ranges) - 1, self.lidar_samples, dtype=np.int32)
         sampled = ranges[idx]
+        sampled_angles = float(msg.angle_min) + idx.astype(np.float32) * float(msg.angle_increment)
 
         self.scan_norm = np.clip(sampled / self.lidar_max_range, 0.0, 1.0).astype(np.float32)
+        self.scan_sampled = sampled.astype(np.float32)
+        self.scan_angles = sampled_angles.astype(np.float32)
         self.min_obstacle_distance = float(np.min(sampled))
+        self._update_dead_end_signal()
         self.has_scan = True
 
     def compute_state(self) -> np.ndarray:
@@ -169,6 +210,11 @@ class GoalSeekerEnvironment:
         reward = 0.0
         done = False
         reason = "running"
+        cell_visits = self._update_visit_memory()
+        if self.episodic_memory_enabled:
+            self.last_revisit_ratio = float(np.clip((cell_visits - 1) / self.memory_revisit_saturation, 0.0, 1.0))
+        else:
+            self.last_revisit_ratio = 0.0
 
         # Approach bonus: +100 * (D_{t-1} - D_t), only when moving closer.
         if self.previous_goal_distance is not None and goal_distance < self.previous_goal_distance:
@@ -188,6 +234,10 @@ class GoalSeekerEnvironment:
                 reward -= 10.0
                 done = True
                 reason = "stuck"
+            elif self.episodic_memory_enabled:
+                novelty = 1.0 / math.sqrt(float(cell_visits))
+                reward += self.memory_novelty_reward * novelty
+                reward -= self.memory_revisit_penalty * self.last_revisit_ratio
 
         self.previous_goal_distance = goal_distance
 
@@ -200,6 +250,80 @@ class GoalSeekerEnvironment:
             heading_angle=heading,
             min_obstacle_distance=self.min_obstacle_distance,
         )
+
+    def get_escape_signal(self) -> tuple[bool, float, float]:
+        """Return dead-end detection signal for optional action override."""
+        return self.dead_end_detected, self.dead_end_turn_hint, self.dead_end_intensity
+
+    def _reset_episodic_memory(self) -> None:
+        """Clear per-episode location memory and dead-end state."""
+        self.visit_counts.clear()
+        self.last_memory_cell = None
+        self.last_revisit_ratio = 0.0
+        self.dead_end_detected = False
+        self.dead_end_turn_hint = 0.0
+        self.dead_end_intensity = 0.0
+
+    def _grid_cell(self, x: float, y: float) -> tuple[int, int]:
+        """Convert world position to discretized memory cell id."""
+        return (
+            int(round(x / self.memory_cell_size)),
+            int(round(y / self.memory_cell_size)),
+        )
+
+    def _update_visit_memory(self) -> int:
+        """Update visit count for current grid cell and return current cell count."""
+        if not self.episodic_memory_enabled:
+            self.last_revisit_ratio = 0.0
+            return 1
+
+        current_cell = self._grid_cell(self.robot_x, self.robot_y)
+        if current_cell != self.last_memory_cell:
+            self.visit_counts[current_cell] = self.visit_counts.get(current_cell, 0) + 1
+            self.last_memory_cell = current_cell
+        return self.visit_counts.get(current_cell, 1)
+
+    def _update_dead_end_signal(self) -> None:
+        """Estimate dead-end presence and suggested turn direction from LiDAR sectors."""
+        front_mask = np.abs(self.scan_angles) <= self.dead_end_front_angle_rad
+        left_mask = (self.scan_angles >= self.dead_end_side_min_angle_rad) & (
+            self.scan_angles <= self.dead_end_side_max_angle_rad
+        )
+        right_mask = (self.scan_angles <= -self.dead_end_side_min_angle_rad) & (
+            self.scan_angles >= -self.dead_end_side_max_angle_rad
+        )
+        if (not np.any(front_mask)) or (not np.any(left_mask)) or (not np.any(right_mask)):
+            self.dead_end_detected = False
+            self.dead_end_turn_hint = 0.0
+            self.dead_end_intensity = 0.0
+            return
+
+        front_clear = float(np.percentile(self.scan_sampled[front_mask], 80))
+        left_clear = float(np.percentile(self.scan_sampled[left_mask], 80))
+        right_clear = float(np.percentile(self.scan_sampled[right_mask], 80))
+        side_best = max(left_clear, right_clear)
+        turn_hint = 1.0 if left_clear >= right_clear else -1.0
+        revisit_escape = self.last_revisit_ratio >= self.dead_end_revisit_gate
+
+        dead_end = (
+            front_clear < self.dead_end_front_distance
+            and side_best > (front_clear + self.dead_end_clearance_margin)
+            and side_best > self.dead_end_side_distance
+        )
+        if (not dead_end) and revisit_escape and front_clear < (self.dead_end_front_distance + 0.15):
+            dead_end = True
+
+        if dead_end:
+            intensity = float(
+                np.clip((self.dead_end_front_distance - front_clear) / max(0.01, self.dead_end_front_distance), 0.0, 1.0)
+            )
+            self.dead_end_detected = True
+            self.dead_end_turn_hint = turn_hint
+            self.dead_end_intensity = intensity
+        else:
+            self.dead_end_detected = False
+            self.dead_end_turn_hint = 0.0
+            self.dead_end_intensity = 0.0
 
     def _goal_metrics(self) -> tuple[float, float]:
         """Return distance and relative heading to active goal."""
@@ -232,6 +356,13 @@ class GoalSeekerEnvironment:
         if history_duration < self.stuck_window_sec * 0.7:
             return 0.0
 
+        start = self.position_history[0]
+        end = self.position_history[-1]
+        net_displacement = math.hypot(end[1] - start[1], end[2] - start[2])
+        if net_displacement >= self.stuck_min_displacement:
+            # The robot has made meaningful progress in the recent window.
+            return 0.0
+
         cells = [
             (
                 int(round(x / self.stuck_cell_size)),
@@ -239,8 +370,18 @@ class GoalSeekerEnvironment:
             )
             for (_, x, y) in self.position_history
         ]
-        unique_cells = len(set(cells))
-        return 1.0 - (unique_cells / float(len(cells)))
+        # Remove consecutive duplicates so slow motion inside one grid cell does not
+        # look like pathological looping.
+        compressed_cells = [cells[0]]
+        for cell in cells[1:]:
+            if cell != compressed_cells[-1]:
+                compressed_cells.append(cell)
+
+        if len(compressed_cells) < 6:
+            return 0.0
+
+        unique_cells = len(set(compressed_cells))
+        return 1.0 - (unique_cells / float(len(compressed_cells)))
 
     @staticmethod
     def _yaw_from_quaternion(x: float, y: float, z: float, w: float) -> float:
