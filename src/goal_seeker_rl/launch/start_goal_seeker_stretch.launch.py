@@ -25,7 +25,10 @@ def generate_launch_description() -> LaunchDescription:
     reference_state_scan_samples = LaunchConfiguration("reference_state_scan_samples")
     resume_model_path = LaunchConfiguration("resume_model_path")
     checkpoint_dir = LaunchConfiguration("checkpoint_dir")
+    checkpoint_interval_steps = LaunchConfiguration("checkpoint_interval_steps")
     auto_goal_training = LaunchConfiguration("auto_goal_training")
+    max_episode_steps = LaunchConfiguration("max_episode_steps")
+    warmup_steps = LaunchConfiguration("warmup_steps")
     rviz_config = LaunchConfiguration("rviz_config")
 
     default_rviz = PathJoinSubstitution([FindPackageShare("goal_seeker_rl"), "rviz", "stretch_nav_config.rviz"])
@@ -69,6 +72,9 @@ def generate_launch_description() -> LaunchDescription:
                 "reference_state_scan_samples": reference_state_scan_samples,
                 "resume_model_path": resume_model_path,
                 "checkpoint_dir": checkpoint_dir,
+                "checkpoint_interval_steps": checkpoint_interval_steps,
+                "max_episode_steps": max_episode_steps,
+                "warmup_steps": warmup_steps,
                 "scan_topic": "/scan_filtered",
                 "odom_topic": "/odom",
                 "cmd_vel_topic": "/stretch/cmd_vel",
@@ -109,6 +115,9 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("reference_state_scan_samples", default_value="40"),
             DeclareLaunchArgument("resume_model_path", default_value=""),
             DeclareLaunchArgument("auto_goal_training", default_value="false"),
+            DeclareLaunchArgument("max_episode_steps", default_value="1800"),
+            DeclareLaunchArgument("warmup_steps", default_value="2000"),
+            DeclareLaunchArgument("checkpoint_interval_steps", default_value="2000"),
             DeclareLaunchArgument(
                 "checkpoint_dir",
                 default_value="/home/david/Desktop/laiting/rl_base_navigation/src/goal_seeker_rl/model",
