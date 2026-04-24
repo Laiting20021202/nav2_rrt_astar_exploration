@@ -23,7 +23,7 @@ from rclpy.time import Time
 
 from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
-import tf2_geometry_msgs  # noqa: F401  # Registers PoseStamped transform support.
+from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -44,12 +44,14 @@ class HRLGlobalPlanner(Node):
         self.local_waypoint_topic = str(self.get_parameter("local_waypoint_topic").value)
         self.global_path_topic = str(self.get_parameter("global_path_topic").value)
         self.map_frame = str(self.get_parameter("map_frame").value)
+        self.waypoint_publish_frame = str(self.get_parameter("waypoint_publish_frame").value)
 
         self.lookahead_distance = float(self.get_parameter("lookahead_distance").value)
         self.timer_period_sec = float(self.get_parameter("timer_period_sec").value)
         self.stuck_window_sec = float(self.get_parameter("stuck_window_sec").value)
         self.stuck_distance_threshold = float(self.get_parameter("stuck_distance_threshold").value)
         self.replan_cooldown_sec = float(self.get_parameter("replan_cooldown_sec").value)
+        self.periodic_replan_sec = float(self.get_parameter("periodic_replan_sec").value)
 
         self.obstacle_threshold = int(self.get_parameter("occupancy_obstacle_threshold").value)
         self.obstacle_inflation_radius_m = float(
@@ -91,6 +93,17 @@ class HRLGlobalPlanner(Node):
         self.waypoint_hold_timeout_sec = float(
             self.get_parameter("waypoint_hold_timeout_sec").value
         )
+        self.waypoint_min_distance = float(self.get_parameter("waypoint_min_distance").value)
+        self.waypoint_max_distance = float(self.get_parameter("waypoint_max_distance").value)
+        self.waypoint_goal_weight = float(self.get_parameter("waypoint_goal_weight").value)
+        self.waypoint_heading_weight = float(self.get_parameter("waypoint_heading_weight").value)
+        self.waypoint_revisit_weight = float(self.get_parameter("waypoint_revisit_weight").value)
+        self.waypoint_clearance_weight = float(
+            self.get_parameter("waypoint_clearance_weight").value
+        )
+        self.waypoint_clearance_radius_m = float(
+            self.get_parameter("waypoint_clearance_radius_m").value
+        )
 
         self.publish_waypoint_marker = bool(self.get_parameter("publish_waypoint_marker").value)
         self.waypoint_marker_topic = str(self.get_parameter("waypoint_marker_topic").value)
@@ -117,6 +130,8 @@ class HRLGlobalPlanner(Node):
         self.visit_heatmap: Optional[np.ndarray] = None
         self.last_odom: Optional[Odometry] = None
         self.goal_in_map: Optional[PoseStamped] = None
+        self.map_update_seq = 0
+        self.last_plan_map_seq = -1
 
         self.path_world: list[tuple[float, float]] = []
         self.path_cells: list[Cell] = []
@@ -133,6 +148,7 @@ class HRLGlobalPlanner(Node):
 
         self.last_replan_sec = -1e9
         self.pose_history: Deque[tuple[float, float, float]] = deque()
+        self._last_tf_warn_sec = -1e9
 
         self.create_subscription(OccupancyGrid, self.map_topic, self._map_callback, 10)
         self.create_subscription(Odometry, self.odom_topic, self._odom_callback, 10)
@@ -168,12 +184,14 @@ class HRLGlobalPlanner(Node):
         self.declare_parameter("local_waypoint_topic", "/hrl_local_waypoint")
         self.declare_parameter("global_path_topic", "/hrl_global_path")
         self.declare_parameter("map_frame", "map")
+        self.declare_parameter("waypoint_publish_frame", "odom")
 
         self.declare_parameter("lookahead_distance", 1.0)
         self.declare_parameter("timer_period_sec", 0.5)
         self.declare_parameter("stuck_window_sec", 6.0)
         self.declare_parameter("stuck_distance_threshold", 0.08)
         self.declare_parameter("replan_cooldown_sec", 6.0)
+        self.declare_parameter("periodic_replan_sec", 1.0)
 
         self.declare_parameter("occupancy_obstacle_threshold", 65)
         self.declare_parameter("obstacle_inflation_radius_m", 0.22)
@@ -203,6 +221,13 @@ class HRLGlobalPlanner(Node):
         self.declare_parameter("path_max_skip_cells", 24)
         self.declare_parameter("waypoint_reached_distance", 0.45)
         self.declare_parameter("waypoint_hold_timeout_sec", 2.0)
+        self.declare_parameter("waypoint_min_distance", 0.7)
+        self.declare_parameter("waypoint_max_distance", 3.0)
+        self.declare_parameter("waypoint_goal_weight", 2.8)
+        self.declare_parameter("waypoint_heading_weight", 0.8)
+        self.declare_parameter("waypoint_revisit_weight", 1.5)
+        self.declare_parameter("waypoint_clearance_weight", 1.3)
+        self.declare_parameter("waypoint_clearance_radius_m", 0.8)
 
         self.declare_parameter("publish_waypoint_marker", True)
         self.declare_parameter("waypoint_marker_topic", "/hrl_waypoint_marker")
@@ -217,6 +242,7 @@ class HRLGlobalPlanner(Node):
     def _map_callback(self, msg: OccupancyGrid) -> None:
         """Cache latest occupancy grid."""
         self.map_msg = msg
+        self.map_update_seq += 1
         width = int(msg.info.width)
         height = int(msg.info.height)
         if width > 0 and height > 0:
@@ -284,32 +310,65 @@ class HRLGlobalPlanner(Node):
         self._publish_deadzone_markers()
 
         should_replan = False
+        force_replan = False
         if not self.path_world:
             should_replan = True
+            force_replan = True
+        elif (now - self.last_replan_sec) >= self.periodic_replan_sec:
+            # Refresh only when map changed and route mode really needs it.
+            map_changed = self.map_update_seq > self.last_plan_map_seq
+            if map_changed and ("attemptable" in self.last_plan_mode):
+                should_replan = True
+            elif (
+                map_changed
+                and ("frontier" in self.last_plan_mode)
+                and (robot_cell is not None)
+                and (self.active_frontier_cell is not None)
+            ):
+                # Keep current frontier stable; only switch after reaching it.
+                frontier_dist = self._heuristic(robot_cell, self.active_frontier_cell)
+                reached_cells = max(
+                    2.0,
+                    self._meter_to_cells(max(0.8, 1.5 * self.waypoint_reached_distance)),
+                )
+                if frontier_dist <= reached_cells:
+                    should_replan = True
+                    force_replan = True
         elif (robot_cell is not None) and self._frontier_should_abort(now, robot_cell):
             should_replan = True
+            force_replan = True
             if self.active_frontier_cell is not None:
                 self._mark_frontier_failed(self.active_frontier_cell, now, reason="stagnation")
             self.get_logger().warn("Frontier stagnation detected. Switching to new frontier.")
         elif self._is_stuck(now) and (now - self.last_replan_sec) >= self.replan_cooldown_sec:
             should_replan = True
+            force_replan = True
             if self.active_frontier_cell is not None:
                 self._mark_frontier_failed(self.active_frontier_cell, now, reason="stuck")
             self.get_logger().warn("Recovery triggered: robot appears stuck, forcing global replan.")
 
-        if should_replan and (not self._replan(force=True)):
-            return
+        if should_replan:
+            replanned = self._replan(force=force_replan)
+            if (not replanned) and (not self.path_world):
+                return
 
-        waypoint = self._extract_lookahead_waypoint(rx, ry)
+        waypoint = self._extract_best_waypoint(robot_pose_map)
         if waypoint is None:
             if not self._replan(force=True):
                 return
-            waypoint = self._extract_lookahead_waypoint(rx, ry)
+            waypoint = self._extract_best_waypoint(robot_pose_map)
             if waypoint is None:
                 return
 
-        self.waypoint_pub.publish(waypoint)
-        self._publish_waypoint_marker(waypoint)
+        publish_wp = waypoint
+        if self.waypoint_publish_frame and (waypoint.header.frame_id != self.waypoint_publish_frame):
+            tf_wp = self._transform_pose(waypoint, self.waypoint_publish_frame)
+            if tf_wp is None:
+                # Skip this cycle rather than sending a stale-frame waypoint.
+                return
+            publish_wp = tf_wp
+        self.waypoint_pub.publish(publish_wp)
+        self._publish_waypoint_marker(publish_wp)
 
     def _replan(self, force: bool = False) -> bool:
         """Compute global path with FAR-inspired known/attemptable/frontier logic."""
@@ -383,6 +442,7 @@ class HRLGlobalPlanner(Node):
         self.current_waypoint_idx = 0
         self.current_waypoint_set_sec = -1e9
         self.last_replan_sec = now
+        self.last_plan_map_seq = self.map_update_seq
 
         self.active_frontier_cell = frontier_cell
         if frontier_cell is not None:
@@ -589,11 +649,15 @@ class HRLGlobalPlanner(Node):
             dist_goal = self._heuristic(cell, goal_cell)
             fail_penalty = self._frontier_failure_penalty(cell, now)
             revisit_penalty = self._frontier_revisit_penalty(cell)
+            heading_penalty = 0.0
+            if heading_cos < self.frontier_goal_heading_min_cos:
+                heading_penalty = (self.frontier_goal_heading_min_cos - heading_cos) * 1.5
             score = (
                 self.frontier_goal_weight * (dist_goal / diag)
-                - self.frontier_start_weight * (dist_start / diag)
+                + self.frontier_start_weight * (dist_start / diag)
                 - self.frontier_gain_weight * min(gain / 25.0, 1.0)
-                - self.frontier_goal_heading_weight * max(heading_cos, self.frontier_goal_heading_min_cos)
+                - self.frontier_goal_heading_weight * heading_cos
+                + heading_penalty
                 + fail_penalty
                 + revisit_penalty
             )
@@ -636,60 +700,90 @@ class HRLGlobalPlanner(Node):
                 q.append((nx, ny))
         return mask
 
-    def _extract_lookahead_waypoint(self, robot_x: float, robot_y: float) -> Optional[PoseStamped]:
-        """Pick a forward waypoint using monotonic path progress + arc-length lookahead."""
+    def _extract_best_waypoint(self, robot_pose_map: PoseStamped) -> Optional[PoseStamped]:
+        """Select the most useful waypoint every cycle using map-aware scoring."""
         if not self.path_world:
             return None
+
         now_sec = self._now_sec()
-        points = np.asarray(self.path_world, dtype=np.float32)
+        robot_x = float(robot_pose_map.pose.position.x)
+        robot_y = float(robot_pose_map.pose.position.y)
+        robot_yaw = self._yaw_from_quaternion(robot_pose_map.pose.orientation)
         robot = np.array([robot_x, robot_y], dtype=np.float32)
+        points = np.asarray(self.path_world, dtype=np.float32)
+
         d2 = np.sum((points - robot[None, :]) ** 2, axis=1)
         nearest_idx = int(np.argmin(d2))
         self.path_progress_idx = max(self.path_progress_idx, nearest_idx)
-        self.current_waypoint_idx = max(self.current_waypoint_idx, self.path_progress_idx)
 
-        # If robot already reached current waypoint, force move to next point to avoid orbiting.
-        cur_idx = min(self.current_waypoint_idx, len(self.path_world) - 1)
-        cur_pt = self.path_world[cur_idx]
-        if (
-            math.hypot(cur_pt[0] - robot_x, cur_pt[1] - robot_y) < self.waypoint_reached_distance
-            and cur_idx < (len(self.path_world) - 1)
-        ):
-            cur_idx += 1
-            self.current_waypoint_idx = cur_idx
+        map_diag_m = self._map_diag_meters()
+        min_arc = max(self.waypoint_min_distance, 0.25)
+        max_arc = max(self.waypoint_max_distance, min_arc + 0.2, self.lookahead_distance)
 
-        # FAR-like forward projection: choose waypoint by arc length along path,
-        # not straight Euclidean radius from robot.
-        chosen_idx = len(self.path_world) - 1
+        candidates: list[tuple[float, int]] = []
         accum = 0.0
-        for i in range(cur_idx, len(self.path_world) - 1):
+        start_idx = min(self.path_progress_idx, len(self.path_world) - 1)
+        for i in range(start_idx, len(self.path_world) - 1):
             x0, y0 = self.path_world[i]
             x1, y1 = self.path_world[i + 1]
             accum += math.hypot(x1 - x0, y1 - y0)
-            if accum >= self.lookahead_distance:
-                chosen_idx = i + 1
+            if accum < min_arc:
+                continue
+            if accum > max_arc:
                 break
 
-        chosen_idx = max(self.current_waypoint_idx, chosen_idx)
-        if chosen_idx != self.current_waypoint_idx:
-            self.current_waypoint_idx = chosen_idx
-            self.current_waypoint_set_sec = now_sec
+            idx = i + 1
+            wx, wy = self.path_world[idx]
+            dist_goal = (
+                math.hypot(
+                    wx - float(self.goal_in_map.pose.position.x),
+                    wy - float(self.goal_in_map.pose.position.y),
+                )
+                if self.goal_in_map is not None
+                else 0.0
+            )
+            goal_term = -self.waypoint_goal_weight * (dist_goal / max(map_diag_m, 1e-3))
+
+            heading = math.atan2(wy - robot_y, wx - robot_x)
+            heading_raw = self._normalize_angle(heading - robot_yaw)
+            # Avoid selecting far waypoints that require near U-turns.
+            if abs(heading_raw) > 2.7 and accum > (min_arc + 0.4):
+                continue
+            heading_err = abs(heading_raw) / math.pi
+            heading_term = -self.waypoint_heading_weight * heading_err
+
+            cell = self._world_to_map(wx, wy)
+            revisit = self._waypoint_revisit_penalty(cell) if cell is not None else 0.0
+            revisit_term = -self.waypoint_revisit_weight * revisit
+
+            clearance = self._waypoint_clearance_score(cell) if cell is not None else 0.0
+            clearance_term = self.waypoint_clearance_weight * clearance
+
+            progress_term = 0.9 * float(np.clip(accum / max_arc, 0.0, 1.0))
+            score = goal_term + heading_term + revisit_term + clearance_term + progress_term
+            candidates.append((score, idx))
+
+        if not candidates:
+            chosen_idx = min(max(self.path_progress_idx + 1, 0), len(self.path_world) - 1)
         else:
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            chosen_idx = candidates[0][1]
+
+        # If a waypoint stays too long and still not reached, advance one step.
+        if chosen_idx == self.current_waypoint_idx:
             if self.current_waypoint_set_sec < -1e8:
                 self.current_waypoint_set_sec = now_sec
-            stale_time = now_sec - self.current_waypoint_set_sec
-            if (
-                stale_time > self.waypoint_hold_timeout_sec
-                and self.current_waypoint_idx < (len(self.path_world) - 1)
-            ):
-                cur_wx, cur_wy = self.path_world[self.current_waypoint_idx]
-                dist_to_cur = math.hypot(cur_wx - robot_x, cur_wy - robot_y)
-                if dist_to_cur > (1.2 * self.waypoint_reached_distance):
-                    self.current_waypoint_idx += 1
-                    self.current_waypoint_set_sec = now_sec
-        chosen_idx = self.current_waypoint_idx
+            elif (now_sec - self.current_waypoint_set_sec) > self.waypoint_hold_timeout_sec:
+                if self.current_waypoint_idx < (len(self.path_world) - 1):
+                    cw_x, cw_y = self.path_world[self.current_waypoint_idx]
+                    if math.hypot(cw_x - robot_x, cw_y - robot_y) > (1.15 * self.waypoint_reached_distance):
+                        chosen_idx = self.current_waypoint_idx + 1
+        else:
+            self.current_waypoint_set_sec = now_sec
 
-        wx, wy = self.path_world[chosen_idx]
+        self.current_waypoint_idx = int(np.clip(chosen_idx, 0, len(self.path_world) - 1))
+        wx, wy = self.path_world[self.current_waypoint_idx]
+
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
         msg.header.frame_id = self.map_frame
@@ -698,6 +792,71 @@ class HRLGlobalPlanner(Node):
         msg.pose.position.z = 0.0
         msg.pose.orientation.w = 1.0
         return msg
+
+    def _waypoint_revisit_penalty(self, cell: Cell) -> float:
+        """Return normalized revisit penalty [0,1] based on local visitation heat."""
+        if self.visit_heatmap is None:
+            return 0.0
+        x, y = cell
+        h, w = self.visit_heatmap.shape
+        x0 = max(0, x - 2)
+        x1 = min(w, x + 3)
+        y0 = max(0, y - 2)
+        y1 = min(h, y + 3)
+        if x0 >= x1 or y0 >= y1:
+            return 0.0
+        heat = float(np.sum(self.visit_heatmap[y0:y1, x0:x1]))
+        return float(np.clip(heat / 20.0, 0.0, 1.0))
+
+    def _waypoint_clearance_score(self, cell: Cell) -> float:
+        """Return clearance score [0,1], higher when farther from inflated obstacles."""
+        if (self.inflated_obstacle_mask is None) or (self.map_msg is None):
+            return 0.0
+        x, y = cell
+        mask = self.inflated_obstacle_mask
+        h, w = mask.shape
+        radius_cells = max(1, int(round(self._meter_to_cells(self.waypoint_clearance_radius_m))))
+        x0 = max(0, x - radius_cells)
+        x1 = min(w, x + radius_cells + 1)
+        y0 = max(0, y - radius_cells)
+        y1 = min(h, y + radius_cells + 1)
+        local = mask[y0:y1, x0:x1]
+        if local.size == 0:
+            return 0.0
+        obs = np.argwhere(local)
+        if obs.size == 0:
+            return 1.0
+        cx = x - x0
+        cy = y - y0
+        dx = obs[:, 1].astype(np.float32) - float(cx)
+        dy = obs[:, 0].astype(np.float32) - float(cy)
+        min_dist = float(np.min(np.sqrt(dx * dx + dy * dy)))
+        return float(np.clip(min_dist / max(float(radius_cells), 1.0), 0.0, 1.0))
+
+    def _map_diag_meters(self) -> float:
+        """Return map diagonal length in meters."""
+        if self.map_msg is None:
+            return 1.0
+        w = float(self.map_msg.info.width)
+        h = float(self.map_msg.info.height)
+        res = float(self.map_msg.info.resolution)
+        return max(1e-3, math.hypot(w, h) * res)
+
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        """Normalize angle to [-pi, pi]."""
+        while angle > math.pi:
+            angle -= 2.0 * math.pi
+        while angle < -math.pi:
+            angle += 2.0 * math.pi
+        return angle
+
+    @staticmethod
+    def _yaw_from_quaternion(q) -> float:
+        """Extract yaw from quaternion."""
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
 
     def _publish_debug_path(self) -> None:
         """Publish current global path for visualization/debug."""
@@ -829,27 +988,38 @@ class HRLGlobalPlanner(Node):
         """Transform pose into target frame using TF."""
         if pose.header.frame_id == target_frame:
             return pose
-        req = PoseStamped()
-        req.header.frame_id = pose.header.frame_id
-        req.header.stamp = Time().to_msg()  # Use latest TF to avoid stale-time lock.
-        req.pose = pose.pose
+        # Query latest TF and apply transform explicitly to avoid stale timestamp mismatch.
         try:
-            out = self.tf_buffer.transform(
-                req,
+            tf = self.tf_buffer.lookup_transform(
                 target_frame,
+                pose.header.frame_id,
+                Time(seconds=0.0),
                 timeout=Duration(seconds=0.2),
             )
         except TransformException as exc:
-            self.get_logger().warn(
-                f"TF transform failed ({pose.header.frame_id} -> {target_frame}): {exc}"
-            )
+            now = self._now_sec()
+            if (now - self._last_tf_warn_sec) > 1.0:
+                self._last_tf_warn_sec = now
+                self.get_logger().warn(
+                    f"TF transform failed ({pose.header.frame_id} -> {target_frame}): {exc}"
+                )
             return None
+
+        req = PoseStamped()
+        req.header.frame_id = pose.header.frame_id
+        req.header.stamp = tf.header.stamp
+        req.pose = pose.pose
+        try:
+            out = do_transform_pose_stamped(req, tf)
         except Exception as exc:
-            self.get_logger().warn(
-                f"Pose transform error ({pose.header.frame_id} -> {target_frame}): {exc}"
-            )
+            now = self._now_sec()
+            if (now - self._last_tf_warn_sec) > 1.0:
+                self._last_tf_warn_sec = now
+                self.get_logger().warn(
+                    f"Pose transform error ({pose.header.frame_id} -> {target_frame}): {exc}"
+                )
             return None
-        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.stamp = tf.header.stamp
         out.header.frame_id = target_frame
         return out
 

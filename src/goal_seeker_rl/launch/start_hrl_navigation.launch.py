@@ -36,7 +36,15 @@ def generate_launch_description() -> LaunchDescription:
     planner_frontier_fail_hard_threshold = LaunchConfiguration("planner_frontier_fail_hard_threshold")
     planner_frontier_fail_hard_radius_cells = LaunchConfiguration("planner_frontier_fail_hard_radius_cells")
     planner_frontier_goal_heading_weight = LaunchConfiguration("planner_frontier_goal_heading_weight")
+    planner_periodic_replan_sec = LaunchConfiguration("planner_periodic_replan_sec")
     planner_waypoint_hold_timeout_sec = LaunchConfiguration("planner_waypoint_hold_timeout_sec")
+    planner_waypoint_min_distance = LaunchConfiguration("planner_waypoint_min_distance")
+    planner_waypoint_max_distance = LaunchConfiguration("planner_waypoint_max_distance")
+    planner_waypoint_goal_weight = LaunchConfiguration("planner_waypoint_goal_weight")
+    planner_waypoint_heading_weight = LaunchConfiguration("planner_waypoint_heading_weight")
+    planner_waypoint_revisit_weight = LaunchConfiguration("planner_waypoint_revisit_weight")
+    planner_waypoint_clearance_weight = LaunchConfiguration("planner_waypoint_clearance_weight")
+    planner_waypoint_clearance_radius_m = LaunchConfiguration("planner_waypoint_clearance_radius_m")
     policy_blend_far = LaunchConfiguration("policy_blend_far")
     policy_blend_near_obstacle = LaunchConfiguration("policy_blend_near_obstacle")
     policy_blend_obstacle_distance = LaunchConfiguration("policy_blend_obstacle_distance")
@@ -44,6 +52,9 @@ def generate_launch_description() -> LaunchDescription:
     local_obstacle_slow_distance = LaunchConfiguration("local_obstacle_slow_distance")
     local_obstacle_hard_stop_distance = LaunchConfiguration("local_obstacle_hard_stop_distance")
     local_side_guard_distance = LaunchConfiguration("local_side_guard_distance")
+    local_avoid_turn_boost = LaunchConfiguration("local_avoid_turn_boost")
+    local_control_rate_hz = LaunchConfiguration("local_control_rate_hz")
+    local_turn_in_place_angle = LaunchConfiguration("local_turn_in_place_angle")
 
     default_world = PathJoinSubstitution(
         [FindPackageShare("goal_seeker_rl"), "worlds", "goal_seeker_large_dynamic.world"]
@@ -123,7 +134,8 @@ def generate_launch_description() -> LaunchDescription:
                 "timer_period_sec": 0.25,
                 "stuck_window_sec": 6.0,
                 "stuck_distance_threshold": 0.08,
-                "replan_cooldown_sec": 6.0,
+                "replan_cooldown_sec": 1.0,
+                "periodic_replan_sec": planner_periodic_replan_sec,
                 "occupancy_obstacle_threshold": 65,
                 "obstacle_inflation_radius_m": planner_obstacle_inflation_radius_m,
                 "allow_unknown": True,
@@ -131,16 +143,23 @@ def generate_launch_description() -> LaunchDescription:
                 "frontier_search_enabled": True,
                 "frontier_sample_limit": 1200,
                 "frontier_top_k": 40,
-                "frontier_goal_weight": 1.0,
-                "frontier_start_weight": 0.35,
-                "frontier_min_distance": 0.8,
+                "frontier_goal_weight": 2.4,
+                "frontier_start_weight": 0.55,
+                "frontier_min_distance": 1.5,
                 "frontier_min_separation": 1.5,
                 "frontier_goal_heading_weight": planner_frontier_goal_heading_weight,
-                "frontier_goal_heading_min_cos": -0.05,
+                "frontier_goal_heading_min_cos": 0.12,
                 "path_smoothing_enabled": True,
                 "path_max_skip_cells": 24,
                 "waypoint_reached_distance": planner_waypoint_reached_distance,
                 "waypoint_hold_timeout_sec": planner_waypoint_hold_timeout_sec,
+                "waypoint_min_distance": planner_waypoint_min_distance,
+                "waypoint_max_distance": planner_waypoint_max_distance,
+                "waypoint_goal_weight": planner_waypoint_goal_weight,
+                "waypoint_heading_weight": planner_waypoint_heading_weight,
+                "waypoint_revisit_weight": planner_waypoint_revisit_weight,
+                "waypoint_clearance_weight": planner_waypoint_clearance_weight,
+                "waypoint_clearance_radius_m": planner_waypoint_clearance_radius_m,
                 "frontier_revisit_weight": 3.2,
                 "frontier_fail_radius_cells": planner_frontier_fail_radius_cells,
                 "frontier_fail_hard_threshold": planner_frontier_fail_hard_threshold,
@@ -152,6 +171,7 @@ def generate_launch_description() -> LaunchDescription:
                 "local_waypoint_topic": "/hrl_local_waypoint",
                 "global_path_topic": "/hrl_global_path",
                 "map_frame": "map",
+                "waypoint_publish_frame": "odom",
                 "publish_waypoint_marker": True,
                 "waypoint_marker_topic": "/hrl_waypoint_marker",
                 "publish_goal_direction_marker": True,
@@ -178,16 +198,18 @@ def generate_launch_description() -> LaunchDescription:
                 "base_frame": "base_link",
                 "scan_samples": local_scan_samples,
                 "lidar_max_range": 3.5,
-                "control_rate_hz": 10.0,
+                "control_rate_hz": local_control_rate_hz,
                 "linear_speed_max": linear_speed_max,
                 "angular_speed_max": angular_speed_max,
                 "waypoint_timeout_sec": 2.0,
-                "obstacle_stop_distance": 0.20,
+                "obstacle_stop_distance": 0.18,
                 "obstacle_slow_distance": local_obstacle_slow_distance,
                 "obstacle_hard_stop_distance": local_obstacle_hard_stop_distance,
                 "side_guard_distance": local_side_guard_distance,
+                "avoid_turn_boost": local_avoid_turn_boost,
                 "waypoint_close_distance": local_waypoint_close_distance,
                 "waypoint_stop_distance": local_waypoint_stop_distance,
+                "turn_in_place_angle": local_turn_in_place_angle,
                 "policy_blend_far": policy_blend_far,
                 "policy_blend_near_obstacle": policy_blend_near_obstacle,
                 "policy_blend_obstacle_distance": policy_blend_obstacle_distance,
@@ -222,8 +244,9 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("world", default_value=default_world),
             DeclareLaunchArgument("lookahead_distance", default_value="1.5"),
             DeclareLaunchArgument("local_scan_samples", default_value="40"),
-            DeclareLaunchArgument("linear_speed_max", default_value="0.18"),
-            DeclareLaunchArgument("angular_speed_max", default_value="2.0"),
+            DeclareLaunchArgument("local_control_rate_hz", default_value="15.0"),
+            DeclareLaunchArgument("linear_speed_max", default_value="0.20"),
+            DeclareLaunchArgument("angular_speed_max", default_value="2.2"),
             DeclareLaunchArgument("local_policy_source", default_value="reference_actor"),
             DeclareLaunchArgument(
                 "local_model_path",
@@ -234,21 +257,31 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("local_append_prev_action", default_value="true"),
             DeclareLaunchArgument("local_policy_max_goal_distance", default_value="5.94"),
             DeclareLaunchArgument("planner_waypoint_reached_distance", default_value="0.50"),
+            DeclareLaunchArgument("planner_periodic_replan_sec", default_value="2.0"),
             DeclareLaunchArgument("planner_waypoint_hold_timeout_sec", default_value="1.6"),
+            DeclareLaunchArgument("planner_waypoint_min_distance", default_value="0.8"),
+            DeclareLaunchArgument("planner_waypoint_max_distance", default_value="2.4"),
+            DeclareLaunchArgument("planner_waypoint_goal_weight", default_value="2.8"),
+            DeclareLaunchArgument("planner_waypoint_heading_weight", default_value="0.85"),
+            DeclareLaunchArgument("planner_waypoint_revisit_weight", default_value="1.6"),
+            DeclareLaunchArgument("planner_waypoint_clearance_weight", default_value="1.2"),
+            DeclareLaunchArgument("planner_waypoint_clearance_radius_m", default_value="0.75"),
             DeclareLaunchArgument("local_waypoint_close_distance", default_value="0.50"),
             DeclareLaunchArgument("local_waypoint_stop_distance", default_value="0.18"),
             DeclareLaunchArgument("planner_obstacle_inflation_radius_m", default_value="0.24"),
             DeclareLaunchArgument("planner_frontier_fail_radius_cells", default_value="30"),
             DeclareLaunchArgument("planner_frontier_fail_hard_threshold", default_value="2"),
             DeclareLaunchArgument("planner_frontier_fail_hard_radius_cells", default_value="30"),
-            DeclareLaunchArgument("planner_frontier_goal_heading_weight", default_value="1.8"),
-            DeclareLaunchArgument("policy_blend_far", default_value="0.08"),
-            DeclareLaunchArgument("policy_blend_near_obstacle", default_value="0.18"),
-            DeclareLaunchArgument("policy_blend_obstacle_distance", default_value="0.80"),
+            DeclareLaunchArgument("planner_frontier_goal_heading_weight", default_value="2.4"),
+            DeclareLaunchArgument("policy_blend_far", default_value="0.04"),
+            DeclareLaunchArgument("policy_blend_near_obstacle", default_value="0.12"),
+            DeclareLaunchArgument("policy_blend_obstacle_distance", default_value="1.00"),
             DeclareLaunchArgument("enable_local_escape", default_value="true"),
-            DeclareLaunchArgument("local_obstacle_slow_distance", default_value="0.38"),
-            DeclareLaunchArgument("local_obstacle_hard_stop_distance", default_value="0.28"),
-            DeclareLaunchArgument("local_side_guard_distance", default_value="0.24"),
+            DeclareLaunchArgument("local_obstacle_slow_distance", default_value="0.45"),
+            DeclareLaunchArgument("local_obstacle_hard_stop_distance", default_value="0.25"),
+            DeclareLaunchArgument("local_side_guard_distance", default_value="0.26"),
+            DeclareLaunchArgument("local_avoid_turn_boost", default_value="0.45"),
+            DeclareLaunchArgument("local_turn_in_place_angle", default_value="1.25"),
             set_gazebo_model_path,
             set_gazebo_plugin_path,
             gzserver_launch,

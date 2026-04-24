@@ -23,7 +23,7 @@ from rclpy.time import Time
 
 from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import LaserScan
-import tf2_geometry_msgs  # noqa: F401  # Registers PoseStamped transform support.
+from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_ros import Buffer, TransformException, TransformListener
 import torch
 
@@ -53,10 +53,12 @@ class RLLocalDriver(Node):
             self.get_parameter("obstacle_hard_stop_distance").value
         )
         self.side_guard_distance = float(self.get_parameter("side_guard_distance").value)
+        self.avoid_turn_boost = float(self.get_parameter("avoid_turn_boost").value)
         self.progress_window_sec = float(self.get_parameter("progress_window_sec").value)
         self.progress_min_delta = float(self.get_parameter("progress_min_delta").value)
         self.waypoint_close_distance = float(self.get_parameter("waypoint_close_distance").value)
         self.waypoint_stop_distance = float(self.get_parameter("waypoint_stop_distance").value)
+        self.turn_in_place_angle = float(self.get_parameter("turn_in_place_angle").value)
         self.policy_blend_far = float(self.get_parameter("policy_blend_far").value)
         self.policy_blend_near_obstacle = float(
             self.get_parameter("policy_blend_near_obstacle").value
@@ -85,6 +87,7 @@ class RLLocalDriver(Node):
         self.latest_waypoint_recv_sec = -1e9
         self.has_scan = False
         self._last_debug_sec = -1e9
+        self._last_tf_warn_sec = -1e9
         self.prev_action_norm = np.zeros(2, dtype=np.float32)
         self.waypoint_progress: Deque[tuple[float, float]] = deque()
         self.escape_turn_sign = 1.0
@@ -110,18 +113,20 @@ class RLLocalDriver(Node):
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("scan_samples", 40)
         self.declare_parameter("lidar_max_range", 3.5)
-        self.declare_parameter("control_rate_hz", 10.0)
+        self.declare_parameter("control_rate_hz", 15.0)
         self.declare_parameter("linear_speed_max", 0.20)
-        self.declare_parameter("angular_speed_max", 1.8)
+        self.declare_parameter("angular_speed_max", 2.2)
         self.declare_parameter("waypoint_timeout_sec", 2.0)
         self.declare_parameter("obstacle_stop_distance", 0.22)
         self.declare_parameter("obstacle_slow_distance", 0.38)
         self.declare_parameter("obstacle_hard_stop_distance", 0.28)
         self.declare_parameter("side_guard_distance", 0.24)
+        self.declare_parameter("avoid_turn_boost", 0.42)
         self.declare_parameter("progress_window_sec", 4.0)
         self.declare_parameter("progress_min_delta", 0.20)
         self.declare_parameter("waypoint_close_distance", 0.45)
         self.declare_parameter("waypoint_stop_distance", 0.15)
+        self.declare_parameter("turn_in_place_angle", 1.25)
         self.declare_parameter("policy_blend_far", 0.15)
         self.declare_parameter("policy_blend_near_obstacle", 0.40)
         self.declare_parameter("policy_blend_obstacle_distance", 0.70)
@@ -304,6 +309,17 @@ class RLLocalDriver(Node):
         angular = float(action[1] * self.angular_speed_max)
         angular = float(np.clip(angular, -self.angular_speed_max, self.angular_speed_max))
 
+        # Do not keep pushing forward when heading error is large; rotate decisively.
+        if abs(relative_angle) > self.turn_in_place_angle:
+            linear = min(linear, 0.03 if front_min > (self.obstacle_stop_distance + 0.06) else 0.0)
+            angular = float(
+                np.clip(
+                    math.copysign(max(abs(angular), 0.75 * self.angular_speed_max), relative_angle),
+                    -self.angular_speed_max,
+                    self.angular_speed_max,
+                )
+            )
+
         # Near waypoint: prioritize passing through instead of orbiting in place.
         if (
             relative_dist < self.waypoint_close_distance
@@ -336,13 +352,29 @@ class RLLocalDriver(Node):
             turn_sign = 1.0 if left_clear >= right_clear else -1.0
             angular = float(
                 np.clip(
-                    turn_sign * max(abs(angular), 0.85 * self.angular_speed_max),
+                    turn_sign * max(abs(angular), 0.95 * self.angular_speed_max),
                     -self.angular_speed_max,
                     self.angular_speed_max,
                 )
             )
         elif front_min < self.obstacle_slow_distance:
             linear = min(linear, 0.04)
+            # Fast reactive turn when entering a narrow obstacle zone.
+            inv_fl = 1.0 / max(front_left_min, 0.08)
+            inv_fr = 1.0 / max(front_right_min, 0.08)
+            side_bias = float(np.clip(inv_fr - inv_fl, -2.0, 2.0))
+            angular += self.avoid_turn_boost * side_bias * self.angular_speed_max
+            angular = float(np.clip(angular, -self.angular_speed_max, self.angular_speed_max))
+            linear = min(
+                linear,
+                float(
+                    np.clip(
+                        0.10 * (front_min / max(self.obstacle_slow_distance, 1e-3)),
+                        0.02,
+                        0.08,
+                    )
+                ),
+            )
 
         # Side guard: avoid steering into nearby side wall while squeezing through corridors.
         if front_left_min < self.side_guard_distance and angular > 0.0:
@@ -388,27 +420,38 @@ class RLLocalDriver(Node):
         """TF transform helper."""
         if pose.header.frame_id == target_frame:
             return pose
-        req = PoseStamped()
-        req.header.frame_id = pose.header.frame_id
-        req.header.stamp = Time().to_msg()  # Use latest TF to avoid stale-time lock.
-        req.pose = pose.pose
+        # Query latest available TF and apply to the input pose.
         try:
-            out = self.tf_buffer.transform(
-                req,
+            tf = self.tf_buffer.lookup_transform(
                 target_frame,
+                pose.header.frame_id,
+                Time(seconds=0.0),
                 timeout=Duration(seconds=0.2),
             )
         except TransformException as exc:
-            self.get_logger().warn(
-                f"TF transform failed ({pose.header.frame_id} -> {target_frame}): {exc}"
-            )
+            now = self._now_sec()
+            if (now - self._last_tf_warn_sec) > 1.0:
+                self._last_tf_warn_sec = now
+                self.get_logger().warn(
+                    f"TF transform failed ({pose.header.frame_id} -> {target_frame}): {exc}"
+                )
             return None
+
+        req = PoseStamped()
+        req.header.frame_id = pose.header.frame_id
+        req.header.stamp = tf.header.stamp
+        req.pose = pose.pose
+        try:
+            out = do_transform_pose_stamped(req, tf)
         except Exception as exc:
-            self.get_logger().warn(
-                f"Pose transform error ({pose.header.frame_id} -> {target_frame}): {exc}"
-            )
+            now = self._now_sec()
+            if (now - self._last_tf_warn_sec) > 1.0:
+                self._last_tf_warn_sec = now
+                self.get_logger().warn(
+                    f"Pose transform error ({pose.header.frame_id} -> {target_frame}): {exc}"
+                )
             return None
-        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.stamp = tf.header.stamp
         out.header.frame_id = target_frame
         return out
 
