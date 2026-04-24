@@ -23,6 +23,7 @@ from rclpy.time import Time
 
 from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from std_msgs.msg import Bool
 from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_ros import Buffer, TransformException, TransformListener
 from visualization_msgs.msg import Marker, MarkerArray
@@ -41,12 +42,14 @@ class HRLGlobalPlanner(Node):
         self.map_topic = str(self.get_parameter("map_topic").value)
         self.odom_topic = str(self.get_parameter("odom_topic").value)
         self.goal_topic = str(self.get_parameter("goal_topic").value)
+        self.goal_active_topic = str(self.get_parameter("goal_active_topic").value)
         self.local_waypoint_topic = str(self.get_parameter("local_waypoint_topic").value)
         self.global_path_topic = str(self.get_parameter("global_path_topic").value)
         self.map_frame = str(self.get_parameter("map_frame").value)
         self.waypoint_publish_frame = str(self.get_parameter("waypoint_publish_frame").value)
 
         self.lookahead_distance = float(self.get_parameter("lookahead_distance").value)
+        self.goal_reached_distance = float(self.get_parameter("goal_reached_distance").value)
         self.timer_period_sec = float(self.get_parameter("timer_period_sec").value)
         self.stuck_window_sec = float(self.get_parameter("stuck_window_sec").value)
         self.stuck_distance_threshold = float(self.get_parameter("stuck_distance_threshold").value)
@@ -133,6 +136,7 @@ class HRLGlobalPlanner(Node):
         self.visit_heatmap: Optional[np.ndarray] = None
         self.last_odom: Optional[Odometry] = None
         self.goal_in_map: Optional[PoseStamped] = None
+        self.goal_active = False
         self.map_update_seq = 0
         self.last_plan_map_seq = -1
 
@@ -156,6 +160,7 @@ class HRLGlobalPlanner(Node):
         self.create_subscription(OccupancyGrid, self.map_topic, self._map_callback, 10)
         self.create_subscription(Odometry, self.odom_topic, self._odom_callback, 10)
         self.create_subscription(PoseStamped, self.goal_topic, self._goal_callback, 10)
+        self.goal_active_pub = self.create_publisher(Bool, self.goal_active_topic, 10)
         self.waypoint_pub = self.create_publisher(PoseStamped, self.local_waypoint_topic, 10)
         self.path_pub = self.create_publisher(Path, self.global_path_topic, 1)
         self.waypoint_marker_pub = (
@@ -174,6 +179,7 @@ class HRLGlobalPlanner(Node):
             else None
         )
         self.create_timer(self.timer_period_sec, self._timer_callback)
+        self._publish_goal_active(False)
 
         self.get_logger().info(
             "HRL global planner ready (FAR-inspired). Waiting for /goal_pose and /map ..."
@@ -184,12 +190,14 @@ class HRLGlobalPlanner(Node):
         self.declare_parameter("map_topic", "/map")
         self.declare_parameter("odom_topic", "/odom")
         self.declare_parameter("goal_topic", "/goal_pose")
+        self.declare_parameter("goal_active_topic", "/hrl_goal_active")
         self.declare_parameter("local_waypoint_topic", "/hrl_local_waypoint")
         self.declare_parameter("global_path_topic", "/hrl_global_path")
         self.declare_parameter("map_frame", "map")
         self.declare_parameter("waypoint_publish_frame", "map")
 
         self.declare_parameter("lookahead_distance", 1.0)
+        self.declare_parameter("goal_reached_distance", 0.35)
         self.declare_parameter("timer_period_sec", 0.5)
         self.declare_parameter("stuck_window_sec", 6.0)
         self.declare_parameter("stuck_distance_threshold", 0.08)
@@ -279,12 +287,8 @@ class HRLGlobalPlanner(Node):
             )
             return
         self.goal_in_map = goal_map
-        self.path_world = []
-        self.path_cells = []
-        self.path_progress_idx = 0
-        self.current_waypoint_idx = 0
-        self.current_waypoint_set_sec = -1e9
-        self.active_frontier_cell = None
+        self._reset_path_state()
+        self._publish_goal_active(True)
         self.pose_history.clear()
         self._cleanup_frontier_failures(self._now_sec())
         self.get_logger().info(
@@ -294,7 +298,11 @@ class HRLGlobalPlanner(Node):
 
     def _timer_callback(self) -> None:
         """Periodic update: monitor progress, replan if needed, publish lookahead waypoint."""
-        if self.map_msg is None or self.goal_in_map is None or self.last_odom is None:
+        if self.goal_in_map is None:
+            self._publish_goal_active(False)
+            return
+        self._publish_goal_active(True)
+        if self.map_msg is None or self.last_odom is None:
             return
 
         robot_pose_map = self._robot_pose_in_map()
@@ -304,6 +312,21 @@ class HRLGlobalPlanner(Node):
         now = self._now_sec()
         rx = float(robot_pose_map.pose.position.x)
         ry = float(robot_pose_map.pose.position.y)
+        goal_dist = math.hypot(
+            rx - float(self.goal_in_map.pose.position.x),
+            ry - float(self.goal_in_map.pose.position.y),
+        )
+        if goal_dist <= self.goal_reached_distance:
+            self.get_logger().info(
+                f"Goal reached. dist={goal_dist:.3f}m <= tol={self.goal_reached_distance:.3f}m"
+            )
+            self.goal_in_map = None
+            self._publish_goal_active(False)
+            self._reset_path_state()
+            self._publish_empty_path()
+            self._delete_waypoint_marker()
+            return
+
         self._update_pose_history(now, rx, ry)
         self._cleanup_frontier_failures(now)
 
@@ -904,6 +927,45 @@ class HRLGlobalPlanner(Node):
             pose.pose.orientation.w = 1.0
             msg.poses.append(pose)
         self.path_pub.publish(msg)
+
+    def _publish_empty_path(self) -> None:
+        """Publish an empty path to clear RViz path display."""
+        msg = Path()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.map_frame
+        self.path_pub.publish(msg)
+
+    def _publish_goal_active(self, active: bool) -> None:
+        """Publish goal-active state for local driver gating."""
+        self.goal_active = active
+        msg = Bool()
+        msg.data = bool(active)
+        self.goal_active_pub.publish(msg)
+
+    def _reset_path_state(self) -> None:
+        """Reset all path and frontier-tracking states."""
+        self.path_world = []
+        self.path_cells = []
+        self.path_progress_idx = 0
+        self.current_waypoint_idx = 0
+        self.current_waypoint_set_sec = -1e9
+        self.active_frontier_cell = None
+        self.frontier_start_dist_cells = 0.0
+        self.frontier_best_dist_cells = float("inf")
+        self.frontier_track_start_sec = 0.0
+        self.last_plan_mode = "idle"
+
+    def _delete_waypoint_marker(self) -> None:
+        """Delete active waypoint marker so RViz does not show stale target."""
+        if (not self.publish_waypoint_marker) or (self.waypoint_marker_pub is None):
+            return
+        marker = Marker()
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.header.frame_id = self.map_frame
+        marker.ns = "hrl_local_waypoint"
+        marker.id = 0
+        marker.action = Marker.DELETE
+        self.waypoint_marker_pub.publish(marker)
 
     def _publish_waypoint_marker(self, waypoint: PoseStamped) -> None:
         """Publish the active local waypoint marker for RViz."""

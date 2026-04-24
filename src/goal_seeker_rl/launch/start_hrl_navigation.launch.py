@@ -29,6 +29,7 @@ def generate_launch_description() -> LaunchDescription:
     local_append_prev_action = LaunchConfiguration("local_append_prev_action")
     local_policy_max_goal_distance = LaunchConfiguration("local_policy_max_goal_distance")
     planner_waypoint_reached_distance = LaunchConfiguration("planner_waypoint_reached_distance")
+    planner_goal_reached_distance = LaunchConfiguration("planner_goal_reached_distance")
     local_waypoint_close_distance = LaunchConfiguration("local_waypoint_close_distance")
     local_waypoint_stop_distance = LaunchConfiguration("local_waypoint_stop_distance")
     planner_obstacle_inflation_radius_m = LaunchConfiguration("planner_obstacle_inflation_radius_m")
@@ -55,6 +56,10 @@ def generate_launch_description() -> LaunchDescription:
     local_avoid_turn_boost = LaunchConfiguration("local_avoid_turn_boost")
     local_control_rate_hz = LaunchConfiguration("local_control_rate_hz")
     local_turn_in_place_angle = LaunchConfiguration("local_turn_in_place_angle")
+    local_orbit_break_angle = LaunchConfiguration("local_orbit_break_angle")
+    local_goal_active_timeout = LaunchConfiguration("local_goal_active_timeout")
+    local_emergency_stop_distance = LaunchConfiguration("local_emergency_stop_distance")
+    local_proactive_avoid_distance = LaunchConfiguration("local_proactive_avoid_distance")
 
     default_world = PathJoinSubstitution(
         [FindPackageShare("goal_seeker_rl"), "worlds", "goal_seeker_large_dynamic.world"]
@@ -131,6 +136,7 @@ def generate_launch_description() -> LaunchDescription:
             {
                 "use_sim_time": use_sim_time,
                 "lookahead_distance": lookahead_distance,
+                "goal_reached_distance": planner_goal_reached_distance,
                 "timer_period_sec": 0.25,
                 "stuck_window_sec": 6.0,
                 "stuck_distance_threshold": 0.08,
@@ -169,6 +175,7 @@ def generate_launch_description() -> LaunchDescription:
                 "map_topic": "/map",
                 "odom_topic": "/odom",
                 "goal_topic": "/goal_pose",
+                "goal_active_topic": "/hrl_goal_active",
                 "local_waypoint_topic": "/hrl_local_waypoint",
                 "global_path_topic": "/hrl_global_path",
                 "map_frame": "map",
@@ -195,6 +202,7 @@ def generate_launch_description() -> LaunchDescription:
                 "use_sim_time": use_sim_time,
                 "scan_topic": "/scan",
                 "waypoint_topic": "/hrl_local_waypoint",
+                "goal_active_topic": "/hrl_goal_active",
                 "cmd_vel_topic": "/cmd_vel",
                 "base_frame": "base_link",
                 "scan_samples": local_scan_samples,
@@ -202,15 +210,19 @@ def generate_launch_description() -> LaunchDescription:
                 "control_rate_hz": local_control_rate_hz,
                 "linear_speed_max": linear_speed_max,
                 "angular_speed_max": angular_speed_max,
+                "goal_active_timeout_sec": local_goal_active_timeout,
                 "waypoint_timeout_sec": 2.0,
                 "obstacle_stop_distance": 0.18,
                 "obstacle_slow_distance": local_obstacle_slow_distance,
                 "obstacle_hard_stop_distance": local_obstacle_hard_stop_distance,
+                "emergency_stop_distance": local_emergency_stop_distance,
+                "proactive_avoid_distance": local_proactive_avoid_distance,
                 "side_guard_distance": local_side_guard_distance,
                 "avoid_turn_boost": local_avoid_turn_boost,
                 "waypoint_close_distance": local_waypoint_close_distance,
                 "waypoint_stop_distance": local_waypoint_stop_distance,
                 "turn_in_place_angle": local_turn_in_place_angle,
+                "orbit_break_angle": local_orbit_break_angle,
                 "policy_blend_far": policy_blend_far,
                 "policy_blend_near_obstacle": policy_blend_near_obstacle,
                 "policy_blend_obstacle_distance": policy_blend_obstacle_distance,
@@ -258,6 +270,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("local_append_prev_action", default_value="true"),
             DeclareLaunchArgument("local_policy_max_goal_distance", default_value="5.94"),
             DeclareLaunchArgument("planner_waypoint_reached_distance", default_value="0.50"),
+            DeclareLaunchArgument("planner_goal_reached_distance", default_value="0.35"),
             DeclareLaunchArgument("planner_periodic_replan_sec", default_value="2.0"),
             DeclareLaunchArgument("planner_waypoint_hold_timeout_sec", default_value="1.6"),
             DeclareLaunchArgument("planner_waypoint_min_distance", default_value="0.8"),
@@ -283,6 +296,10 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("local_side_guard_distance", default_value="0.26"),
             DeclareLaunchArgument("local_avoid_turn_boost", default_value="0.45"),
             DeclareLaunchArgument("local_turn_in_place_angle", default_value="1.25"),
+            DeclareLaunchArgument("local_orbit_break_angle", default_value="1.65"),
+            DeclareLaunchArgument("local_goal_active_timeout", default_value="1.2"),
+            DeclareLaunchArgument("local_emergency_stop_distance", default_value="0.24"),
+            DeclareLaunchArgument("local_proactive_avoid_distance", default_value="0.85"),
             set_gazebo_model_path,
             set_gazebo_plugin_path,
             gzserver_launch,

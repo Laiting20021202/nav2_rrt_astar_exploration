@@ -23,6 +23,7 @@ from rclpy.time import Time
 
 from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Bool
 from tf2_geometry_msgs import do_transform_pose_stamped
 from tf2_ros import Buffer, TransformException, TransformListener
 import torch
@@ -39,6 +40,7 @@ class RLLocalDriver(Node):
 
         self.scan_topic = str(self.get_parameter("scan_topic").value)
         self.waypoint_topic = str(self.get_parameter("waypoint_topic").value)
+        self.goal_active_topic = str(self.get_parameter("goal_active_topic").value)
         self.cmd_vel_topic = str(self.get_parameter("cmd_vel_topic").value)
         self.base_frame = str(self.get_parameter("base_frame").value)
         self.scan_samples = int(self.get_parameter("scan_samples").value)
@@ -46,11 +48,18 @@ class RLLocalDriver(Node):
         self.control_rate_hz = float(self.get_parameter("control_rate_hz").value)
         self.linear_speed_max = float(self.get_parameter("linear_speed_max").value)
         self.angular_speed_max = float(self.get_parameter("angular_speed_max").value)
+        self.goal_active_timeout_sec = float(self.get_parameter("goal_active_timeout_sec").value)
         self.waypoint_timeout_sec = float(self.get_parameter("waypoint_timeout_sec").value)
         self.obstacle_stop_distance = float(self.get_parameter("obstacle_stop_distance").value)
         self.obstacle_slow_distance = float(self.get_parameter("obstacle_slow_distance").value)
         self.obstacle_hard_stop_distance = float(
             self.get_parameter("obstacle_hard_stop_distance").value
+        )
+        self.emergency_stop_distance = float(
+            self.get_parameter("emergency_stop_distance").value
+        )
+        self.proactive_avoid_distance = float(
+            self.get_parameter("proactive_avoid_distance").value
         )
         self.side_guard_distance = float(self.get_parameter("side_guard_distance").value)
         self.avoid_turn_boost = float(self.get_parameter("avoid_turn_boost").value)
@@ -59,6 +68,7 @@ class RLLocalDriver(Node):
         self.waypoint_close_distance = float(self.get_parameter("waypoint_close_distance").value)
         self.waypoint_stop_distance = float(self.get_parameter("waypoint_stop_distance").value)
         self.turn_in_place_angle = float(self.get_parameter("turn_in_place_angle").value)
+        self.orbit_break_angle = float(self.get_parameter("orbit_break_angle").value)
         self.policy_blend_far = float(self.get_parameter("policy_blend_far").value)
         self.policy_blend_near_obstacle = float(
             self.get_parameter("policy_blend_near_obstacle").value
@@ -83,8 +93,12 @@ class RLLocalDriver(Node):
         self.latest_scan_norm = np.ones(self.scan_samples, dtype=np.float32)
         self.latest_scan_ranges = np.full(self.scan_samples, self.lidar_max_range, dtype=np.float32)
         self.latest_scan_angles = np.linspace(-math.pi, math.pi, self.scan_samples, dtype=np.float32)
+        self.raw_scan_ranges = np.full(360, self.lidar_max_range, dtype=np.float32)
+        self.raw_scan_angles = np.linspace(-math.pi, math.pi, 360, dtype=np.float32)
         self.latest_waypoint: Optional[PoseStamped] = None
         self.latest_waypoint_recv_sec = -1e9
+        self.goal_active = False
+        self.goal_active_recv_sec = -1e9
         self.has_scan = False
         self._last_debug_sec = -1e9
         self._last_tf_warn_sec = -1e9
@@ -98,6 +112,7 @@ class RLLocalDriver(Node):
 
         self.create_subscription(LaserScan, self.scan_topic, self._scan_callback, qos_profile_sensor_data)
         self.create_subscription(PoseStamped, self.waypoint_topic, self._waypoint_callback, 10)
+        self.create_subscription(Bool, self.goal_active_topic, self._goal_active_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
         self.create_timer(max(1e-3, 1.0 / self.control_rate_hz), self._control_loop)
 
@@ -109,6 +124,7 @@ class RLLocalDriver(Node):
         """Declare ROS parameters used by this node."""
         self.declare_parameter("scan_topic", "/scan")
         self.declare_parameter("waypoint_topic", "/hrl_local_waypoint")
+        self.declare_parameter("goal_active_topic", "/hrl_goal_active")
         self.declare_parameter("cmd_vel_topic", "/cmd_vel")
         self.declare_parameter("base_frame", "base_link")
         self.declare_parameter("scan_samples", 40)
@@ -116,10 +132,13 @@ class RLLocalDriver(Node):
         self.declare_parameter("control_rate_hz", 15.0)
         self.declare_parameter("linear_speed_max", 0.20)
         self.declare_parameter("angular_speed_max", 2.2)
+        self.declare_parameter("goal_active_timeout_sec", 1.2)
         self.declare_parameter("waypoint_timeout_sec", 2.0)
         self.declare_parameter("obstacle_stop_distance", 0.22)
         self.declare_parameter("obstacle_slow_distance", 0.38)
         self.declare_parameter("obstacle_hard_stop_distance", 0.28)
+        self.declare_parameter("emergency_stop_distance", 0.24)
+        self.declare_parameter("proactive_avoid_distance", 0.85)
         self.declare_parameter("side_guard_distance", 0.24)
         self.declare_parameter("avoid_turn_boost", 0.42)
         self.declare_parameter("progress_window_sec", 4.0)
@@ -127,6 +146,7 @@ class RLLocalDriver(Node):
         self.declare_parameter("waypoint_close_distance", 0.45)
         self.declare_parameter("waypoint_stop_distance", 0.15)
         self.declare_parameter("turn_in_place_angle", 1.25)
+        self.declare_parameter("orbit_break_angle", 1.65)
         self.declare_parameter("policy_blend_far", 0.15)
         self.declare_parameter("policy_blend_near_obstacle", 0.40)
         self.declare_parameter("policy_blend_obstacle_distance", 0.70)
@@ -182,6 +202,9 @@ class RLLocalDriver(Node):
         fill = min(float(msg.range_max), self.lidar_max_range)
         ranges = np.nan_to_num(ranges, nan=fill, posinf=fill, neginf=fill)
         ranges = np.clip(ranges, float(msg.range_min), self.lidar_max_range)
+        raw_angles = float(msg.angle_min) + np.arange(len(ranges), dtype=np.float32) * float(msg.angle_increment)
+        self.raw_scan_ranges = ranges.astype(np.float32)
+        self.raw_scan_angles = raw_angles.astype(np.float32)
 
         if len(ranges) >= self.scan_samples and (len(ranges) % self.scan_samples == 0):
             stride = len(ranges) // self.scan_samples
@@ -195,6 +218,15 @@ class RLLocalDriver(Node):
         self.latest_scan_angles = sampled_angles.astype(np.float32)
         self.latest_scan_norm = np.clip(sampled / self.lidar_max_range, 0.0, 1.0).astype(np.float32)
         self.has_scan = True
+
+    def _goal_active_callback(self, msg: Bool) -> None:
+        """Store whether global planner currently has an active final goal."""
+        self.goal_active = bool(msg.data)
+        self.goal_active_recv_sec = self._now_sec()
+        if not self.goal_active:
+            self.latest_waypoint = None
+            self.waypoint_progress.clear()
+            self.prev_action_norm[:] = 0.0
 
     def _waypoint_callback(self, msg: PoseStamped) -> None:
         """Store latest tactical waypoint."""
@@ -217,6 +249,9 @@ class RLLocalDriver(Node):
     def _control_loop(self) -> None:
         """Main inference/control loop."""
         now = self._now_sec()
+        if (not self.goal_active) or ((now - self.goal_active_recv_sec) > self.goal_active_timeout_sec):
+            self._publish_stop()
+            return
         if (not self.has_scan) or (self.latest_waypoint is None):
             self._publish_stop()
             return
@@ -247,33 +282,16 @@ class RLLocalDriver(Node):
         if self.append_prev_action_to_state:
             state = np.concatenate([state, self.prev_action_norm]).astype(np.float32)
 
-        # Hard collision guard.
-        front_mask = np.abs(self.latest_scan_angles) < math.radians(25.0)
-        front_min = float(np.min(self.latest_scan_ranges[front_mask])) if np.any(front_mask) else self.lidar_max_range
-        front_left_mask = (self.latest_scan_angles > math.radians(15.0)) & (
-            self.latest_scan_angles < math.radians(75.0)
-        )
-        front_right_mask = (self.latest_scan_angles < -math.radians(15.0)) & (
-            self.latest_scan_angles > -math.radians(75.0)
-        )
-        front_left_min = (
-            float(np.min(self.latest_scan_ranges[front_left_mask]))
-            if np.any(front_left_mask)
-            else self.lidar_max_range
-        )
-        front_right_min = (
-            float(np.min(self.latest_scan_ranges[front_right_mask]))
-            if np.any(front_right_mask)
-            else self.lidar_max_range
-        )
-        left_mask = self.latest_scan_angles > 0.0
-        right_mask = self.latest_scan_angles < 0.0
-        left_clear = float(np.mean(self.latest_scan_ranges[left_mask])) if np.any(left_mask) else self.lidar_max_range
-        right_clear = float(np.mean(self.latest_scan_ranges[right_mask])) if np.any(right_mask) else self.lidar_max_range
+        front_min = self._sector_min(-20.0, 20.0)
+        front_wide_min = self._sector_min(-45.0, 45.0)
+        front_left_min = self._sector_min(15.0, 80.0)
+        front_right_min = self._sector_min(-80.0, -15.0)
+        left_clear = self._sector_mean(40.0, 120.0)
+        right_clear = self._sector_mean(-120.0, -40.0)
         base_action = self._path_follow_action(
             relative_dist=relative_dist,
             relative_angle=relative_angle,
-            front_min=front_min,
+            front_min=front_wide_min,
             left_clear=left_clear,
             right_clear=right_clear,
         )
@@ -320,14 +338,25 @@ class RLLocalDriver(Node):
                 )
             )
 
+        # Break local orbiting near waypoint: rotate in place first, then move.
+        if relative_dist < self.waypoint_close_distance and abs(relative_angle) > self.orbit_break_angle:
+            linear = 0.0
+            angular = float(
+                np.clip(
+                    math.copysign(max(abs(angular), 0.80 * self.angular_speed_max), relative_angle),
+                    -self.angular_speed_max,
+                    self.angular_speed_max,
+                )
+            )
+
         # Near waypoint: prioritize passing through instead of orbiting in place.
         if (
             relative_dist < self.waypoint_close_distance
-            and front_min > self.obstacle_slow_distance
-            and abs(relative_angle) < 0.9
+            and front_wide_min > (self.proactive_avoid_distance + 0.10)
+            and abs(relative_angle) < 0.70
         ):
-            # Keep moving through waypoint area, but avoid forced forward push near obstacles.
-            linear = max(linear, min(0.22 * self.linear_speed_max, 0.05))
+            # Keep slow forward motion only when heading is aligned and nearby area is clear.
+            linear = max(linear, min(0.18 * self.linear_speed_max, 0.035))
 
         # If distance-to-waypoint does not improve for several seconds, force exploration turn.
         if (
@@ -344,37 +373,45 @@ class RLLocalDriver(Node):
                     self.angular_speed_max,
                 )
             )
-            linear = min(linear, 0.03 if front_min > (self.obstacle_stop_distance + 0.05) else 0.0)
-
-        # Safety shield: never allow close-wall forward push due to policy or near-waypoint override.
-        if front_min < self.obstacle_hard_stop_distance:
             linear = 0.0
-            turn_sign = 1.0 if left_clear >= right_clear else -1.0
+
+        turn_sign = 1.0 if left_clear >= right_clear else -1.0
+
+        # Safety shield: raw-scan emergency and proactive avoidance override RL output.
+        if min(front_min, front_wide_min) < self.emergency_stop_distance:
+            linear = 0.0
             angular = float(
                 np.clip(
-                    turn_sign * max(abs(angular), 0.95 * self.angular_speed_max),
+                    turn_sign * max(abs(angular), 0.98 * self.angular_speed_max),
                     -self.angular_speed_max,
                     self.angular_speed_max,
                 )
             )
-        elif front_min < self.obstacle_slow_distance:
-            linear = min(linear, 0.04)
-            # Fast reactive turn when entering a narrow obstacle zone.
+        elif front_wide_min < self.proactive_avoid_distance:
+            proximity = float(
+                np.clip(
+                    (self.proactive_avoid_distance - front_wide_min)
+                    / max(self.proactive_avoid_distance - self.emergency_stop_distance, 1e-3),
+                    0.0,
+                    1.0,
+                )
+            )
+            linear_cap = float(
+                np.clip(
+                    self.linear_speed_max * (0.55 - 0.45 * proximity),
+                    0.02,
+                    self.linear_speed_max * 0.55,
+                )
+            )
+            linear = min(linear, linear_cap)
             inv_fl = 1.0 / max(front_left_min, 0.08)
             inv_fr = 1.0 / max(front_right_min, 0.08)
             side_bias = float(np.clip(inv_fr - inv_fl, -2.0, 2.0))
-            angular += self.avoid_turn_boost * side_bias * self.angular_speed_max
+            angular += (self.avoid_turn_boost + 0.35 * proximity) * side_bias * self.angular_speed_max
+            min_turn = (0.25 + 0.55 * proximity) * self.angular_speed_max
+            if abs(angular) < min_turn:
+                angular = math.copysign(min_turn, angular if abs(angular) > 1e-4 else turn_sign)
             angular = float(np.clip(angular, -self.angular_speed_max, self.angular_speed_max))
-            linear = min(
-                linear,
-                float(
-                    np.clip(
-                        0.10 * (front_min / max(self.obstacle_slow_distance, 1e-3)),
-                        0.02,
-                        0.08,
-                    )
-                ),
-            )
 
         # Side guard: avoid steering into nearby side wall while squeezing through corridors.
         if front_left_min < self.side_guard_distance and angular > 0.0:
@@ -392,16 +429,31 @@ class RLLocalDriver(Node):
                 * float(np.clip((self.side_guard_distance - front_right_min) / self.side_guard_distance, 0.0, 1.0)),
             )
         if min(front_left_min, front_right_min) < self.side_guard_distance:
-            linear = min(linear, 0.05)
+            linear = min(linear, 0.03)
+
+        # Speed governor: reduce forward speed when close to obstacles or turning hard.
+        if front_wide_min < 1.20:
+            clearance_ratio = float(
+                np.clip(
+                    (front_wide_min - self.emergency_stop_distance)
+                    / max(1.20 - self.emergency_stop_distance, 1e-3),
+                    0.10,
+                    1.0,
+                )
+            )
+            linear = min(linear, self.linear_speed_max * clearance_ratio)
+        turn_ratio = float(np.clip(1.0 - abs(angular) / max(0.95 * self.angular_speed_max, 1e-3), 0.15, 1.0))
+        linear = min(linear, self.linear_speed_max * turn_ratio)
 
         if (now - self._last_debug_sec) > 1.0:
             self._last_debug_sec = now
             policy_mode = "model" if self.actor is not None else "heuristic"
             self.get_logger().info(
                 f"ctrl[{policy_mode}] | dist={relative_dist:.2f} ang={relative_angle:.2f} "
-                f"front={front_min:.2f} fl={front_left_min:.2f} fr={front_right_min:.2f} "
+                f"front={front_min:.2f} front_w={front_wide_min:.2f} "
+                f"fl={front_left_min:.2f} fr={front_right_min:.2f} "
                 f"lin={linear:.3f} angz={angular:.3f} "
-                f"rl_weight={rl_weight:.2f} stuck_local={stuck_local}"
+                f"rl_weight={rl_weight:.2f} stuck_local={stuck_local} goal_active={self.goal_active}"
             )
 
         cmd = Twist()
@@ -590,8 +642,35 @@ class RLLocalDriver(Node):
         angular_norm = float(np.clip(angular_cmd / max(self.angular_speed_max, 1e-3), -1.0, 1.0))
         return np.array([linear_norm, angular_norm], dtype=np.float32)
 
+    def _sector_min(self, deg_min: float, deg_max: float) -> float:
+        """Return minimum LiDAR distance in an angular sector (degrees, base_link frame)."""
+        low = math.radians(min(deg_min, deg_max))
+        high = math.radians(max(deg_min, deg_max))
+        angles = self.raw_scan_angles if self.raw_scan_angles.size > 0 else self.latest_scan_angles
+        ranges = self.raw_scan_ranges if self.raw_scan_ranges.size > 0 else self.latest_scan_ranges
+        if ranges.size == 0:
+            return self.lidar_max_range
+        mask = (angles >= low) & (angles <= high)
+        if not np.any(mask):
+            return self.lidar_max_range
+        return float(np.min(ranges[mask]))
+
+    def _sector_mean(self, deg_min: float, deg_max: float) -> float:
+        """Return mean LiDAR distance in an angular sector (degrees, base_link frame)."""
+        low = math.radians(min(deg_min, deg_max))
+        high = math.radians(max(deg_min, deg_max))
+        angles = self.raw_scan_angles if self.raw_scan_angles.size > 0 else self.latest_scan_angles
+        ranges = self.raw_scan_ranges if self.raw_scan_ranges.size > 0 else self.latest_scan_ranges
+        if ranges.size == 0:
+            return self.lidar_max_range
+        mask = (angles >= low) & (angles <= high)
+        if not np.any(mask):
+            return self.lidar_max_range
+        return float(np.mean(ranges[mask]))
+
     def _publish_stop(self) -> None:
-        """Publish zero velocity."""
+        """Publish zero velocity and clear previous action memory."""
+        self.prev_action_norm[:] = 0.0
         self.cmd_pub.publish(Twist())
 
     def _update_waypoint_progress(self, now_sec: float, dist: float) -> None:
