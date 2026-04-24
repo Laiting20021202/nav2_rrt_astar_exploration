@@ -61,6 +61,21 @@ def generate_launch_description() -> LaunchDescription:
     escape_linear_cap = LaunchConfiguration("escape_linear_cap")
     escape_min_turn = LaunchConfiguration("escape_min_turn")
     escape_overlap_gate = LaunchConfiguration("escape_overlap_gate")
+    hybrid_exploration_enabled = LaunchConfiguration("hybrid_exploration_enabled")
+    hybrid_revisit_trigger = LaunchConfiguration("hybrid_revisit_trigger")
+    hybrid_progress_window_sec = LaunchConfiguration("hybrid_progress_window_sec")
+    hybrid_min_progress_delta = LaunchConfiguration("hybrid_min_progress_delta")
+    hybrid_replan_cooldown_sec = LaunchConfiguration("hybrid_replan_cooldown_sec")
+    hybrid_subgoal_timeout_sec = LaunchConfiguration("hybrid_subgoal_timeout_sec")
+    hybrid_subgoal_min_distance = LaunchConfiguration("hybrid_subgoal_min_distance")
+    hybrid_subgoal_max_distance = LaunchConfiguration("hybrid_subgoal_max_distance")
+    hybrid_subgoal_reach_tolerance = LaunchConfiguration("hybrid_subgoal_reach_tolerance")
+    hybrid_subgoal_safety_margin = LaunchConfiguration("hybrid_subgoal_safety_margin")
+    hybrid_subgoal_goal_align_weight = LaunchConfiguration("hybrid_subgoal_goal_align_weight")
+    hybrid_subgoal_gain_weight = LaunchConfiguration("hybrid_subgoal_gain_weight")
+    hybrid_subgoal_revisit_weight = LaunchConfiguration("hybrid_subgoal_revisit_weight")
+    hybrid_subgoal_repeat_penalty = LaunchConfiguration("hybrid_subgoal_repeat_penalty")
+    hybrid_subgoal_random_topk = LaunchConfiguration("hybrid_subgoal_random_topk")
     checkpoint_dir = LaunchConfiguration("checkpoint_dir")
     world = LaunchConfiguration("world")
     rviz_config = LaunchConfiguration("rviz_config")
@@ -170,6 +185,21 @@ def generate_launch_description() -> LaunchDescription:
                 "escape_linear_cap": escape_linear_cap,
                 "escape_min_turn": escape_min_turn,
                 "escape_overlap_gate": escape_overlap_gate,
+                "hybrid_exploration_enabled": hybrid_exploration_enabled,
+                "hybrid_revisit_trigger": hybrid_revisit_trigger,
+                "hybrid_progress_window_sec": hybrid_progress_window_sec,
+                "hybrid_min_progress_delta": hybrid_min_progress_delta,
+                "hybrid_replan_cooldown_sec": hybrid_replan_cooldown_sec,
+                "hybrid_subgoal_timeout_sec": hybrid_subgoal_timeout_sec,
+                "hybrid_subgoal_min_distance": hybrid_subgoal_min_distance,
+                "hybrid_subgoal_max_distance": hybrid_subgoal_max_distance,
+                "hybrid_subgoal_reach_tolerance": hybrid_subgoal_reach_tolerance,
+                "hybrid_subgoal_safety_margin": hybrid_subgoal_safety_margin,
+                "hybrid_subgoal_goal_align_weight": hybrid_subgoal_goal_align_weight,
+                "hybrid_subgoal_gain_weight": hybrid_subgoal_gain_weight,
+                "hybrid_subgoal_revisit_weight": hybrid_subgoal_revisit_weight,
+                "hybrid_subgoal_repeat_penalty": hybrid_subgoal_repeat_penalty,
+                "hybrid_subgoal_random_topk": hybrid_subgoal_random_topk,
                 "checkpoint_dir": checkpoint_dir,
             }
         ],
@@ -229,6 +259,21 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("escape_linear_cap", default_value="0.05"),
             DeclareLaunchArgument("escape_min_turn", default_value="0.60"),
             DeclareLaunchArgument("escape_overlap_gate", default_value="0.55"),
+            DeclareLaunchArgument("hybrid_exploration_enabled", default_value="true"),
+            DeclareLaunchArgument("hybrid_revisit_trigger", default_value="0.35"),
+            DeclareLaunchArgument("hybrid_progress_window_sec", default_value="12.0"),
+            DeclareLaunchArgument("hybrid_min_progress_delta", default_value="0.35"),
+            DeclareLaunchArgument("hybrid_replan_cooldown_sec", default_value="6.0"),
+            DeclareLaunchArgument("hybrid_subgoal_timeout_sec", default_value="30.0"),
+            DeclareLaunchArgument("hybrid_subgoal_min_distance", default_value="0.8"),
+            DeclareLaunchArgument("hybrid_subgoal_max_distance", default_value="2.5"),
+            DeclareLaunchArgument("hybrid_subgoal_reach_tolerance", default_value="0.45"),
+            DeclareLaunchArgument("hybrid_subgoal_safety_margin", default_value="0.25"),
+            DeclareLaunchArgument("hybrid_subgoal_goal_align_weight", default_value="0.55"),
+            DeclareLaunchArgument("hybrid_subgoal_gain_weight", default_value="1.40"),
+            DeclareLaunchArgument("hybrid_subgoal_revisit_weight", default_value="0.80"),
+            DeclareLaunchArgument("hybrid_subgoal_repeat_penalty", default_value="0.90"),
+            DeclareLaunchArgument("hybrid_subgoal_random_topk", default_value="4"),
             DeclareLaunchArgument(
                 "checkpoint_dir",
                 default_value="/home/david/Desktop/laiting/rl_base_navigation/src/goal_seeker_rl/model",

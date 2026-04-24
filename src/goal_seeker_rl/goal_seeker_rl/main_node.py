@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+import math
 from pathlib import Path
 from typing import Optional
 
@@ -95,6 +96,21 @@ class GoalSeekerMainNode(Node):
         self.escape_linear_cap = float(self.get_parameter("escape_linear_cap").value)
         self.escape_min_turn = float(self.get_parameter("escape_min_turn").value)
         self.escape_overlap_gate = float(self.get_parameter("escape_overlap_gate").value)
+        self.hybrid_exploration_enabled = bool(self.get_parameter("hybrid_exploration_enabled").value)
+        self.hybrid_revisit_trigger = float(self.get_parameter("hybrid_revisit_trigger").value)
+        self.hybrid_progress_window_sec = float(self.get_parameter("hybrid_progress_window_sec").value)
+        self.hybrid_min_progress_delta = float(self.get_parameter("hybrid_min_progress_delta").value)
+        self.hybrid_replan_cooldown_sec = float(self.get_parameter("hybrid_replan_cooldown_sec").value)
+        self.hybrid_subgoal_timeout_sec = float(self.get_parameter("hybrid_subgoal_timeout_sec").value)
+        self.hybrid_subgoal_min_distance = float(self.get_parameter("hybrid_subgoal_min_distance").value)
+        self.hybrid_subgoal_max_distance = float(self.get_parameter("hybrid_subgoal_max_distance").value)
+        self.hybrid_subgoal_reach_tolerance = float(self.get_parameter("hybrid_subgoal_reach_tolerance").value)
+        self.hybrid_subgoal_safety_margin = float(self.get_parameter("hybrid_subgoal_safety_margin").value)
+        self.hybrid_subgoal_goal_align_weight = float(self.get_parameter("hybrid_subgoal_goal_align_weight").value)
+        self.hybrid_subgoal_gain_weight = float(self.get_parameter("hybrid_subgoal_gain_weight").value)
+        self.hybrid_subgoal_revisit_weight = float(self.get_parameter("hybrid_subgoal_revisit_weight").value)
+        self.hybrid_subgoal_repeat_penalty = float(self.get_parameter("hybrid_subgoal_repeat_penalty").value)
+        self.hybrid_subgoal_random_topk = int(self.get_parameter("hybrid_subgoal_random_topk").value)
 
         self.scan_topic = str(self.get_parameter("scan_topic").value)
         self.odom_topic = str(self.get_parameter("odom_topic").value)
@@ -215,6 +231,13 @@ class GoalSeekerMainNode(Node):
         self.last_state: Optional[np.ndarray] = None
         self.last_action: Optional[np.ndarray] = None
         self.pause_until_sec = 0.0
+        self.primary_goal_xy: Optional[tuple[float, float]] = None
+        self.active_subgoal_xy: Optional[tuple[float, float]] = None
+        self.current_target_is_subgoal = False
+        self.subgoal_start_sec = 0.0
+        self.last_replan_sec = -1e9
+        self.progress_history: deque[tuple[float, float]] = deque()
+        self.recent_subgoals: deque[tuple[float, float]] = deque(maxlen=12)
 
         self.total_steps = 0
         self.episode_index = 0
@@ -291,6 +314,21 @@ class GoalSeekerMainNode(Node):
         self.declare_parameter("escape_linear_cap", 0.05)
         self.declare_parameter("escape_min_turn", 0.60)
         self.declare_parameter("escape_overlap_gate", 0.55)
+        self.declare_parameter("hybrid_exploration_enabled", True)
+        self.declare_parameter("hybrid_revisit_trigger", 0.35)
+        self.declare_parameter("hybrid_progress_window_sec", 12.0)
+        self.declare_parameter("hybrid_min_progress_delta", 0.35)
+        self.declare_parameter("hybrid_replan_cooldown_sec", 6.0)
+        self.declare_parameter("hybrid_subgoal_timeout_sec", 30.0)
+        self.declare_parameter("hybrid_subgoal_min_distance", 0.8)
+        self.declare_parameter("hybrid_subgoal_max_distance", 2.5)
+        self.declare_parameter("hybrid_subgoal_reach_tolerance", 0.45)
+        self.declare_parameter("hybrid_subgoal_safety_margin", 0.25)
+        self.declare_parameter("hybrid_subgoal_goal_align_weight", 0.55)
+        self.declare_parameter("hybrid_subgoal_gain_weight", 1.40)
+        self.declare_parameter("hybrid_subgoal_revisit_weight", 0.80)
+        self.declare_parameter("hybrid_subgoal_repeat_penalty", 0.90)
+        self.declare_parameter("hybrid_subgoal_random_topk", 4)
 
         self.declare_parameter("hidden_dim", 256)
         self.declare_parameter("batch_size", 128)
@@ -340,7 +378,10 @@ class GoalSeekerMainNode(Node):
         now_sec = self._now_sec()
         gx = float(msg.pose.position.x)
         gy = float(msg.pose.position.y)
-        self._activate_goal(gx, gy, now_sec, source="RViz")
+        self.primary_goal_xy = (gx, gy)
+        self.progress_history.clear()
+        self.recent_subgoals.clear()
+        self._activate_goal(gx, gy, now_sec, source="RViz", reset_episode=True, is_subgoal=False)
 
     def _control_loop(self) -> None:
         """Main control/training/inference loop."""
@@ -370,6 +411,8 @@ class GoalSeekerMainNode(Node):
             # Keep trying in inference instead of stopping too early.
             result.done = False
             result.reason = "running"
+        if self._handle_hybrid_navigation(now_sec, result):
+            return
 
         # The result at tick t is treated as outcome of action from tick t-1.
         if self.last_state is not None and self.last_action is not None:
@@ -405,6 +448,159 @@ class GoalSeekerMainNode(Node):
         self.total_steps += 1
         self.episode_steps += 1
         self.episode_reward += result.reward
+
+    def _handle_hybrid_navigation(self, now_sec: float, result: StepResult) -> bool:
+        """Switch to temporary exploration sub-goals when final-goal progress stalls."""
+        if (not self.inference_mode) or (not self.hybrid_exploration_enabled):
+            return False
+        if self.primary_goal_xy is None:
+            return False
+
+        final_distance = self._distance_to_point(*self.primary_goal_xy)
+        self._update_progress_history(now_sec, final_distance)
+
+        if self.current_target_is_subgoal:
+            reached_subgoal = result.done and result.reason == "goal"
+            if self.active_subgoal_xy is not None:
+                reached_subgoal = reached_subgoal or (
+                    self._distance_to_point(*self.active_subgoal_xy) <= self.hybrid_subgoal_reach_tolerance
+                )
+            if reached_subgoal:
+                self._restore_primary_goal(now_sec, reason="subgoal reached")
+                return True
+            if (now_sec - self.subgoal_start_sec) >= self.hybrid_subgoal_timeout_sec:
+                self._restore_primary_goal(now_sec, reason="subgoal timeout")
+                self.last_replan_sec = now_sec
+                return True
+            return False
+
+        if result.done and result.reason == "goal":
+            return False
+        if (now_sec - self.last_replan_sec) < self.hybrid_replan_cooldown_sec:
+            return False
+
+        stagnating, progress_delta = self._is_progress_stagnating()
+        revisit_high = self.environment.last_revisit_ratio >= self.hybrid_revisit_trigger
+        if not (stagnating or revisit_high):
+            return False
+
+        candidate = self._sample_exploration_subgoal()
+        if candidate is None:
+            return False
+
+        gx, gy, score = candidate
+        self.last_replan_sec = now_sec
+        self._activate_goal(gx, gy, now_sec, source="hybrid subgoal", reset_episode=False, is_subgoal=True)
+        self.get_logger().info(
+            "Hybrid exploration subgoal | "
+            f"x={gx:.2f} y={gy:.2f} score={score:.3f} "
+            f"final_dist={final_distance:.3f} progress_delta={progress_delta:.3f} "
+            f"revisit={self.environment.last_revisit_ratio:.2f}"
+        )
+        return True
+
+    def _update_progress_history(self, now_sec: float, distance_to_primary_goal: float) -> None:
+        """Track recent distance-to-goal trend for stagnation detection."""
+        self.progress_history.append((now_sec, distance_to_primary_goal))
+        min_t = now_sec - self.hybrid_progress_window_sec
+        while self.progress_history and self.progress_history[0][0] < min_t:
+            self.progress_history.popleft()
+
+    def _is_progress_stagnating(self) -> tuple[bool, float]:
+        """Return whether final-goal progress is below threshold over the configured window."""
+        if len(self.progress_history) < 2:
+            return False, 0.0
+        window_dt = self.progress_history[-1][0] - self.progress_history[0][0]
+        progress_delta = self.progress_history[0][1] - self.progress_history[-1][1]
+        if window_dt < self.hybrid_progress_window_sec * 0.7:
+            return False, progress_delta
+        far_enough = self.progress_history[-1][1] > (self.environment.goal_tolerance * 1.5)
+        stagnating = far_enough and (progress_delta < self.hybrid_min_progress_delta)
+        return stagnating, progress_delta
+
+    def _sample_exploration_subgoal(self) -> Optional[tuple[float, float, float]]:
+        """Pick a LiDAR-visible waypoint that is open, less revisited, and somewhat goal-aligned."""
+        if self.primary_goal_xy is None:
+            return None
+
+        scan = self.environment.scan_sampled
+        rel_angles = self.environment.scan_angles
+        if len(scan) == 0 or len(scan) != len(rel_angles):
+            return None
+
+        min_d = max(0.20, self.hybrid_subgoal_min_distance)
+        max_d = max(min_d, self.hybrid_subgoal_max_distance)
+        revisit_scale = max(1.0, float(self.environment.memory_revisit_saturation))
+        current_final_dist = self._distance_to_point(*self.primary_goal_xy)
+        goal_bearing = math.atan2(
+            self.primary_goal_xy[1] - self.environment.robot_y,
+            self.primary_goal_xy[0] - self.environment.robot_x,
+        )
+        candidates: list[tuple[float, float, float, float, float]] = []
+
+        for clear, rel_angle in zip(scan, rel_angles):
+            clear_f = float(clear)
+            if clear_f < (min_d + self.hybrid_subgoal_safety_margin):
+                continue
+
+            travel = min(max_d, clear_f - self.hybrid_subgoal_safety_margin)
+            if travel < min_d:
+                continue
+
+            world_angle = self.environment.robot_yaw + float(rel_angle)
+            gx = float(self.environment.robot_x + travel * math.cos(world_angle))
+            gy = float(self.environment.robot_y + travel * math.sin(world_angle))
+            if abs(gx) > self.auto_goal_max_abs_x or abs(gy) > self.auto_goal_max_abs_y:
+                continue
+
+            openness = float(
+                np.clip(
+                    (clear_f - min_d) / max(1e-6, self.environment.lidar_max_range - min_d),
+                    0.0,
+                    1.0,
+                )
+            )
+            alignment = 0.5 * (1.0 + math.cos(self._wrap_angle(goal_bearing - world_angle)))
+            candidate_final_dist = math.hypot(self.primary_goal_xy[0] - gx, self.primary_goal_xy[1] - gy)
+            distance_gain = float(np.clip((current_final_dist - candidate_final_dist) / max(0.5, max_d), -1.0, 1.0))
+            if alignment < 0.15 and distance_gain < 0.20:
+                # Avoid aggressively exploring behind the goal unless it clearly improves distance.
+                continue
+            visits = float(self.environment.get_visit_count(gx, gy))
+            revisit_penalty = float(np.clip(visits / revisit_scale, 0.0, 1.0))
+            repeat_penalty = 0.0
+            for sx, sy in self.recent_subgoals:
+                d = math.hypot(gx - sx, gy - sy)
+                if d < 1.2:
+                    repeat_penalty = max(repeat_penalty, (1.2 - d) / 1.2)
+            score = openness + (self.hybrid_subgoal_goal_align_weight * alignment)
+            score += self.hybrid_subgoal_gain_weight * distance_gain
+            score -= self.hybrid_subgoal_revisit_weight * revisit_penalty
+            score -= self.hybrid_subgoal_repeat_penalty * repeat_penalty
+            candidates.append((score, distance_gain, alignment, gx, gy))
+
+        if not candidates:
+            return None
+
+        preferred = [c for c in candidates if c[1] >= 0.0 and c[2] >= 0.30]
+        if not preferred:
+            preferred = [c for c in candidates if c[1] >= -0.05 and c[2] >= 0.20]
+        pool_source = preferred if preferred else candidates
+        pool_source.sort(key=lambda item: item[0], reverse=True)
+        top_k = max(1, min(self.hybrid_subgoal_random_topk, len(pool_source)))
+        picked = pool_source[int(self._rng.integers(0, top_k))]
+        return picked[3], picked[4], picked[0]
+
+    def _restore_primary_goal(self, now_sec: float, reason: str) -> None:
+        """Switch control target back to the original user goal after exploration."""
+        if self.primary_goal_xy is None:
+            return
+        gx, gy = self.primary_goal_xy
+        self._activate_goal(gx, gy, now_sec, source=f"resume primary ({reason})", reset_episode=False, is_subgoal=False)
+
+    def _distance_to_point(self, x: float, y: float) -> float:
+        """Return Euclidean distance from robot to a world point."""
+        return math.hypot(x - self.environment.robot_x, y - self.environment.robot_y)
 
     def _finish_episode(self, reason: str, result: StepResult) -> None:
         """Stop robot, log episode summary, and handle reset behavior."""
@@ -442,6 +638,12 @@ class GoalSeekerMainNode(Node):
 
         self.goal_active = False
         self.environment.clear_goal()
+        self.primary_goal_xy = None
+        self.active_subgoal_xy = None
+        self.current_target_is_subgoal = False
+        self.progress_history.clear()
+        self.recent_subgoals.clear()
+        self._clear_subgoal_marker()
 
         if self.inference_mode:
             return
@@ -538,20 +740,49 @@ class GoalSeekerMainNode(Node):
             return
         self.reset_client.call_async(Empty.Request())
 
-    def _activate_goal(self, gx: float, gy: float, now_sec: float, source: str) -> None:
-        """Apply a new goal and reset episode bookkeeping."""
+    def _activate_goal(
+        self,
+        gx: float,
+        gy: float,
+        now_sec: float,
+        source: str,
+        reset_episode: bool,
+        is_subgoal: bool,
+    ) -> None:
+        """Set control target (final goal or temporary sub-goal)."""
         self.environment.set_goal(gx, gy, now_sec)
         self.goal_active = True
         self.last_state = None
         self.last_action = None
         self.prev_action_norm = np.zeros(2, dtype=np.float32)
-        self.episode_steps = 0
-        self.episode_reward = 0.0
-        self.episode_index += 1
+
+        if reset_episode:
+            self.episode_steps = 0
+            self.episode_reward = 0.0
+            self.episode_index += 1
+
+        if is_subgoal:
+            self.current_target_is_subgoal = True
+            self.active_subgoal_xy = (gx, gy)
+            self.subgoal_start_sec = now_sec
+            self.recent_subgoals.append((gx, gy))
+            self._publish_subgoal_marker(gx, gy)
+            self.get_logger().info(
+                f"Subgoal activated ({source}): x={gx:.2f}, y={gy:.2f}. "
+                f"Primary goal remains x={self.primary_goal_xy[0]:.2f}, y={self.primary_goal_xy[1]:.2f}."
+            )
+            return
+
+        self.current_target_is_subgoal = False
+        self.active_subgoal_xy = None
+        self._clear_subgoal_marker()
         self._publish_goal_marker(gx, gy)
-        self.get_logger().info(
-            f"Goal #{self.episode_index} received from {source}: x={gx:.2f}, y={gy:.2f}. Navigation started."
-        )
+        if reset_episode:
+            self.get_logger().info(
+                f"Goal #{self.episode_index} received from {source}: x={gx:.2f}, y={gy:.2f}. Navigation started."
+            )
+        else:
+            self.get_logger().info(f"Primary goal restored ({source}): x={gx:.2f}, y={gy:.2f}.")
 
     def _set_auto_goal(self, now_sec: float) -> None:
         """Sample a training goal around the robot when auto-goal mode is enabled."""
@@ -584,7 +815,12 @@ class GoalSeekerMainNode(Node):
                     gx = float(self.environment.robot_x + radius * np.cos(world_angle))
                     gy = float(self.environment.robot_y + radius * np.sin(world_angle))
                     if abs(gx) <= self.auto_goal_max_abs_x and abs(gy) <= self.auto_goal_max_abs_y:
-                        self._activate_goal(gx, gy, now_sec, source="auto lidar curriculum")
+                        self.primary_goal_xy = (gx, gy)
+                        self.progress_history.clear()
+                        self.recent_subgoals.clear()
+                        self._activate_goal(
+                            gx, gy, now_sec, source="auto lidar curriculum", reset_episode=True, is_subgoal=False
+                        )
                         return
 
         for _ in range(50):
@@ -593,13 +829,19 @@ class GoalSeekerMainNode(Node):
             gx = float(self.environment.robot_x + radius * np.cos(angle))
             gy = float(self.environment.robot_y + radius * np.sin(angle))
             if abs(gx) <= self.auto_goal_max_abs_x and abs(gy) <= self.auto_goal_max_abs_y:
-                self._activate_goal(gx, gy, now_sec, source="auto curriculum")
+                self.primary_goal_xy = (gx, gy)
+                self.progress_history.clear()
+                self.recent_subgoals.clear()
+                self._activate_goal(gx, gy, now_sec, source="auto curriculum", reset_episode=True, is_subgoal=False)
                 return
 
         # Fallback: clip into configured workspace bounds.
         gx = float(np.clip(self.environment.robot_x + max_r, -self.auto_goal_max_abs_x, self.auto_goal_max_abs_x))
         gy = float(np.clip(self.environment.robot_y, -self.auto_goal_max_abs_y, self.auto_goal_max_abs_y))
-        self._activate_goal(gx, gy, now_sec, source="auto fallback")
+        self.primary_goal_xy = (gx, gy)
+        self.progress_history.clear()
+        self.recent_subgoals.clear()
+        self._activate_goal(gx, gy, now_sec, source="auto fallback", reset_episode=True, is_subgoal=False)
 
     def _publish_goal_marker(self, gx: float, gy: float) -> None:
         """Publish a marker so the active goal is always visible in RViz."""
@@ -623,6 +865,42 @@ class GoalSeekerMainNode(Node):
         marker.color.r = 1.0
         marker.color.g = 0.25
         marker.color.b = 0.2
+        self.goal_marker_pub.publish(marker)
+
+    def _publish_subgoal_marker(self, gx: float, gy: float) -> None:
+        """Publish temporary exploration sub-goal marker."""
+        if self.goal_marker_pub is None:
+            return
+        marker = Marker()
+        marker.header.frame_id = self.goal_marker_frame
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "goal_seeker"
+        marker.id = 1
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = gx
+        marker.pose.position.y = gy
+        marker.pose.position.z = 0.10
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = 0.20
+        marker.scale.y = 0.20
+        marker.scale.z = 0.20
+        marker.color.a = 0.9
+        marker.color.r = 0.15
+        marker.color.g = 0.95
+        marker.color.b = 0.95
+        self.goal_marker_pub.publish(marker)
+
+    def _clear_subgoal_marker(self) -> None:
+        """Hide temporary exploration marker when not in use."""
+        if self.goal_marker_pub is None:
+            return
+        marker = Marker()
+        marker.header.frame_id = self.goal_marker_frame
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = "goal_seeker"
+        marker.id = 1
+        marker.action = Marker.DELETE
         self.goal_marker_pub.publish(marker)
 
     def _maybe_save_checkpoint(self) -> None:
@@ -672,6 +950,11 @@ class GoalSeekerMainNode(Node):
         if actor_loss is not None:
             self.tb_writer.add_scalar("loss/actor", actor_loss, step)
         self.tb_writer.flush()
+
+    @staticmethod
+    def _wrap_angle(angle: float) -> float:
+        """Wrap angle to [-pi, pi]."""
+        return math.atan2(math.sin(angle), math.cos(angle))
 
     def _now_sec(self) -> float:
         """Return current ROS time in seconds."""

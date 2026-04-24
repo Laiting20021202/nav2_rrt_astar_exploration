@@ -25,10 +25,11 @@ setup(
     maintainer_email="david@localhost",
     description="TD3-based goal navigation package for TurtleBot3 Waffle in ROS 2 Humble.",
     license="Apache-2.0",
-    tests_require=["pytest"],
     entry_points={
         "console_scripts": [
             "goal_seeker_main = goal_seeker_rl.main_node:main",
+            "hrl_global_planner = goal_seeker_rl.hrl_global_planner:main",
+            "rl_local_driver = goal_seeker_rl.rl_local_driver:main",
         ],
     },
 )

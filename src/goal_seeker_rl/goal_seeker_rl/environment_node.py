@@ -283,6 +283,13 @@ class GoalSeekerEnvironment:
             self.last_memory_cell = current_cell
         return self.visit_counts.get(current_cell, 1)
 
+    def get_visit_count(self, x: float, y: float) -> int:
+        """Return episodic visit count for an arbitrary world position."""
+        if not self.episodic_memory_enabled:
+            return 0
+        cell = self._grid_cell(x, y)
+        return int(self.visit_counts.get(cell, 0))
+
     def _update_dead_end_signal(self) -> None:
         """Estimate dead-end presence and suggested turn direction from LiDAR sectors."""
         front_mask = np.abs(self.scan_angles) <= self.dead_end_front_angle_rad

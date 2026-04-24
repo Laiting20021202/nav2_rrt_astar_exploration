@@ -1,0 +1,201 @@
+"""Launch full hierarchical RL navigation stack in Gazebo."""
+
+from __future__ import annotations
+
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.conditions import IfCondition, UnlessCondition
+from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import Node
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description() -> LaunchDescription:
+    """Start Gazebo + SLAM + HRL global planner + RL local driver + RViz."""
+    use_sim_time = LaunchConfiguration("use_sim_time")
+    headless = LaunchConfiguration("headless")
+    use_rviz = LaunchConfiguration("use_rviz")
+    use_joint_state_publisher = LaunchConfiguration("use_joint_state_publisher")
+    world = LaunchConfiguration("world")
+    lookahead_distance = LaunchConfiguration("lookahead_distance")
+    local_scan_samples = LaunchConfiguration("local_scan_samples")
+    linear_speed_max = LaunchConfiguration("linear_speed_max")
+    angular_speed_max = LaunchConfiguration("angular_speed_max")
+    local_policy_source = LaunchConfiguration("local_policy_source")
+    local_model_path = LaunchConfiguration("local_model_path")
+    local_network_variant = LaunchConfiguration("local_network_variant")
+    local_hidden_dim = LaunchConfiguration("local_hidden_dim")
+    local_append_prev_action = LaunchConfiguration("local_append_prev_action")
+    local_policy_max_goal_distance = LaunchConfiguration("local_policy_max_goal_distance")
+    planner_waypoint_reached_distance = LaunchConfiguration("planner_waypoint_reached_distance")
+    local_waypoint_close_distance = LaunchConfiguration("local_waypoint_close_distance")
+    local_waypoint_stop_distance = LaunchConfiguration("local_waypoint_stop_distance")
+
+    default_world = PathJoinSubstitution(
+        [FindPackageShare("turtlebot3_gazebo"), "worlds", "turtlebot3_houses", "waffle.model"]
+    )
+    robot_urdf = PathJoinSubstitution([FindPackageShare("goal_seeker_rl"), "urdf", "turtlebot3_waffle_minimal.urdf"])
+
+    gzserver_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([FindPackageShare("gazebo_ros"), "launch", "gzserver.launch.py"])
+        ),
+        launch_arguments={"world": world}.items(),
+    )
+
+    gzclient_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([FindPackageShare("gazebo_ros"), "launch", "gzclient.launch.py"])
+        ),
+        condition=UnlessCondition(headless),
+    )
+
+    robot_state_publisher = Node(
+        package="robot_state_publisher",
+        executable="robot_state_publisher",
+        name="robot_state_publisher",
+        output="screen",
+        parameters=[{"use_sim_time": use_sim_time}],
+        arguments=[robot_urdf, "--ros-args", "--log-level", "robot_state_publisher:=fatal"],
+    )
+
+    joint_state_publisher = Node(
+        package="joint_state_publisher",
+        executable="joint_state_publisher",
+        name="joint_state_publisher",
+        output="screen",
+        parameters=[{"use_sim_time": use_sim_time}],
+        condition=IfCondition(use_joint_state_publisher),
+    )
+
+    slam = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([FindPackageShare("slam_toolbox"), "launch", "online_async_launch.py"])
+        ),
+        launch_arguments={"use_sim_time": use_sim_time}.items(),
+    )
+
+    hrl_global_planner = Node(
+        package="goal_seeker_rl",
+        executable="hrl_global_planner",
+        name="hrl_global_planner",
+        output="screen",
+        parameters=[
+            {
+                "use_sim_time": use_sim_time,
+                "lookahead_distance": lookahead_distance,
+                "timer_period_sec": 0.5,
+                "stuck_window_sec": 6.0,
+                "stuck_distance_threshold": 0.08,
+                "replan_cooldown_sec": 6.0,
+                "occupancy_obstacle_threshold": 65,
+                "obstacle_inflation_radius_m": 0.24,
+                "allow_unknown": True,
+                "unknown_penalty": 2.5,
+                "frontier_search_enabled": True,
+                "frontier_sample_limit": 1200,
+                "frontier_top_k": 40,
+                "frontier_goal_weight": 1.0,
+                "frontier_start_weight": 0.35,
+                "frontier_min_distance": 0.8,
+                "frontier_min_separation": 1.2,
+                "path_smoothing_enabled": True,
+                "path_max_skip_cells": 24,
+                "waypoint_reached_distance": planner_waypoint_reached_distance,
+                "frontier_revisit_weight": 2.6,
+                "frontier_fail_radius_cells": 20,
+                "frontier_stagnation_sec": 7.0,
+                "map_topic": "/map",
+                "odom_topic": "/odom",
+                "goal_topic": "/goal_pose",
+                "local_waypoint_topic": "/hrl_local_waypoint",
+                "global_path_topic": "/hrl_global_path",
+                "map_frame": "map",
+                "publish_waypoint_marker": True,
+                "waypoint_marker_topic": "/hrl_waypoint_marker",
+                "publish_goal_direction_marker": True,
+                "goal_direction_marker_topic": "/hrl_goal_direction_marker",
+                "goal_direction_width": 0.07,
+                "publish_deadzone_marker": True,
+                "deadzone_marker_topic": "/hrl_deadzone_markers",
+                "deadzone_marker_scale": 0.30,
+            }
+        ],
+    )
+
+    rl_local_driver = Node(
+        package="goal_seeker_rl",
+        executable="rl_local_driver",
+        name="rl_local_driver",
+        output="screen",
+        parameters=[
+            {
+                "use_sim_time": use_sim_time,
+                "scan_topic": "/scan",
+                "waypoint_topic": "/hrl_local_waypoint",
+                "cmd_vel_topic": "/cmd_vel",
+                "base_frame": "base_link",
+                "scan_samples": local_scan_samples,
+                "lidar_max_range": 3.5,
+                "control_rate_hz": 10.0,
+                "linear_speed_max": linear_speed_max,
+                "angular_speed_max": angular_speed_max,
+                "waypoint_timeout_sec": 2.0,
+                "obstacle_stop_distance": 0.22,
+                "waypoint_close_distance": local_waypoint_close_distance,
+                "waypoint_stop_distance": local_waypoint_stop_distance,
+                "policy_source": local_policy_source,
+                "model_path": local_model_path,
+                "network_variant": local_network_variant,
+                "hidden_dim": local_hidden_dim,
+                "append_prev_action_to_state": local_append_prev_action,
+                "model_strict": False,
+                "policy_max_goal_distance": local_policy_max_goal_distance,
+            }
+        ],
+    )
+
+    rviz = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="rviz2",
+        output="screen",
+        arguments=["-d", PathJoinSubstitution([FindPackageShare("goal_seeker_rl"), "rviz", "nav_config.rviz"])],
+        parameters=[{"use_sim_time": use_sim_time}],
+        condition=IfCondition(use_rviz),
+    )
+
+    return LaunchDescription(
+        [
+            DeclareLaunchArgument("use_sim_time", default_value="true"),
+            DeclareLaunchArgument("headless", default_value="false"),
+            DeclareLaunchArgument("use_rviz", default_value="true"),
+            DeclareLaunchArgument("use_joint_state_publisher", default_value="false"),
+            DeclareLaunchArgument("world", default_value=default_world),
+            DeclareLaunchArgument("lookahead_distance", default_value="1.5"),
+            DeclareLaunchArgument("local_scan_samples", default_value="40"),
+            DeclareLaunchArgument("linear_speed_max", default_value="0.22"),
+            DeclareLaunchArgument("angular_speed_max", default_value="2.0"),
+            DeclareLaunchArgument("local_policy_source", default_value="reference_actor"),
+            DeclareLaunchArgument(
+                "local_model_path",
+                default_value="/home/david/Desktop/laiting/rl_base_navigation/reference/turtlebot3_drlnav/src/turtlebot3_drl/model/examples/ddpg_0_stage9/actor_stage9_episode8000.pt",
+            ),
+            DeclareLaunchArgument("local_network_variant", default_value="reference"),
+            DeclareLaunchArgument("local_hidden_dim", default_value="512"),
+            DeclareLaunchArgument("local_append_prev_action", default_value="true"),
+            DeclareLaunchArgument("local_policy_max_goal_distance", default_value="5.94"),
+            DeclareLaunchArgument("planner_waypoint_reached_distance", default_value="0.50"),
+            DeclareLaunchArgument("local_waypoint_close_distance", default_value="0.50"),
+            DeclareLaunchArgument("local_waypoint_stop_distance", default_value="0.18"),
+            gzserver_launch,
+            gzclient_launch,
+            robot_state_publisher,
+            joint_state_publisher,
+            slam,
+            hrl_global_planner,
+            rl_local_driver,
+            rviz,
+        ]
+    )
