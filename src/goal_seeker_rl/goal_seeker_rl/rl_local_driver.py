@@ -19,6 +19,7 @@ import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
 
 from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import LaserScan
@@ -47,10 +48,23 @@ class RLLocalDriver(Node):
         self.angular_speed_max = float(self.get_parameter("angular_speed_max").value)
         self.waypoint_timeout_sec = float(self.get_parameter("waypoint_timeout_sec").value)
         self.obstacle_stop_distance = float(self.get_parameter("obstacle_stop_distance").value)
+        self.obstacle_slow_distance = float(self.get_parameter("obstacle_slow_distance").value)
+        self.obstacle_hard_stop_distance = float(
+            self.get_parameter("obstacle_hard_stop_distance").value
+        )
+        self.side_guard_distance = float(self.get_parameter("side_guard_distance").value)
         self.progress_window_sec = float(self.get_parameter("progress_window_sec").value)
         self.progress_min_delta = float(self.get_parameter("progress_min_delta").value)
         self.waypoint_close_distance = float(self.get_parameter("waypoint_close_distance").value)
         self.waypoint_stop_distance = float(self.get_parameter("waypoint_stop_distance").value)
+        self.policy_blend_far = float(self.get_parameter("policy_blend_far").value)
+        self.policy_blend_near_obstacle = float(
+            self.get_parameter("policy_blend_near_obstacle").value
+        )
+        self.policy_blend_obstacle_distance = float(
+            self.get_parameter("policy_blend_obstacle_distance").value
+        )
+        self.enable_local_escape = bool(self.get_parameter("enable_local_escape").value)
 
         self.policy_source = str(self.get_parameter("policy_source").value).lower()
         self.model_path = str(self.get_parameter("model_path").value)
@@ -101,10 +115,17 @@ class RLLocalDriver(Node):
         self.declare_parameter("angular_speed_max", 1.8)
         self.declare_parameter("waypoint_timeout_sec", 2.0)
         self.declare_parameter("obstacle_stop_distance", 0.22)
+        self.declare_parameter("obstacle_slow_distance", 0.38)
+        self.declare_parameter("obstacle_hard_stop_distance", 0.28)
+        self.declare_parameter("side_guard_distance", 0.24)
         self.declare_parameter("progress_window_sec", 4.0)
         self.declare_parameter("progress_min_delta", 0.20)
         self.declare_parameter("waypoint_close_distance", 0.45)
         self.declare_parameter("waypoint_stop_distance", 0.15)
+        self.declare_parameter("policy_blend_far", 0.15)
+        self.declare_parameter("policy_blend_near_obstacle", 0.40)
+        self.declare_parameter("policy_blend_obstacle_distance", 0.70)
+        self.declare_parameter("enable_local_escape", False)
 
         # RL policy settings.
         self.declare_parameter("policy_source", "reference_actor")
@@ -172,9 +193,21 @@ class RLLocalDriver(Node):
 
     def _waypoint_callback(self, msg: PoseStamped) -> None:
         """Store latest tactical waypoint."""
+        reset_progress = False
+        if self.latest_waypoint is None:
+            reset_progress = True
+        elif msg.header.frame_id != self.latest_waypoint.header.frame_id:
+            reset_progress = True
+        else:
+            dx = float(msg.pose.position.x - self.latest_waypoint.pose.position.x)
+            dy = float(msg.pose.position.y - self.latest_waypoint.pose.position.y)
+            # Planner republishes every 0.5s; only reset when waypoint jumps noticeably.
+            reset_progress = math.hypot(dx, dy) > max(0.25, 0.6 * self.waypoint_close_distance)
+
         self.latest_waypoint = msg
         self.latest_waypoint_recv_sec = self._now_sec()
-        self.waypoint_progress.clear()
+        if reset_progress:
+            self.waypoint_progress.clear()
 
     def _control_loop(self) -> None:
         """Main inference/control loop."""
@@ -194,6 +227,7 @@ class RLLocalDriver(Node):
         relative_dist = float(math.hypot(rel_x, rel_y))
         relative_angle = float(math.atan2(rel_y, rel_x))
         self._update_waypoint_progress(now, relative_dist)
+        stuck_local = self._is_local_stuck(now, relative_dist)
 
         # Waypoint already reached: wait for planner to roll forward.
         if relative_dist < self.waypoint_stop_distance:
@@ -208,46 +242,83 @@ class RLLocalDriver(Node):
         if self.append_prev_action_to_state:
             state = np.concatenate([state, self.prev_action_norm]).astype(np.float32)
 
-        action_norm = self.predict_action(state, relative_dist, relative_angle)
-        action = np.clip(np.asarray(action_norm, dtype=np.float32), -1.0, 1.0)
-        self.prev_action_norm = action.copy()
-
-        linear = float((action[0] + 1.0) * 0.5 * self.linear_speed_max)
-        angular = float(action[1] * self.angular_speed_max)
-        angular = float(np.clip(angular, -self.angular_speed_max, self.angular_speed_max))
-
         # Hard collision guard.
         front_mask = np.abs(self.latest_scan_angles) < math.radians(25.0)
         front_min = float(np.min(self.latest_scan_ranges[front_mask])) if np.any(front_mask) else self.lidar_max_range
+        front_left_mask = (self.latest_scan_angles > math.radians(15.0)) & (
+            self.latest_scan_angles < math.radians(75.0)
+        )
+        front_right_mask = (self.latest_scan_angles < -math.radians(15.0)) & (
+            self.latest_scan_angles > -math.radians(75.0)
+        )
+        front_left_min = (
+            float(np.min(self.latest_scan_ranges[front_left_mask]))
+            if np.any(front_left_mask)
+            else self.lidar_max_range
+        )
+        front_right_min = (
+            float(np.min(self.latest_scan_ranges[front_right_mask]))
+            if np.any(front_right_mask)
+            else self.lidar_max_range
+        )
         left_mask = self.latest_scan_angles > 0.0
         right_mask = self.latest_scan_angles < 0.0
         left_clear = float(np.mean(self.latest_scan_ranges[left_mask])) if np.any(left_mask) else self.lidar_max_range
         right_clear = float(np.mean(self.latest_scan_ranges[right_mask])) if np.any(right_mask) else self.lidar_max_range
-        if front_min < self.obstacle_stop_distance and linear > 0.0:
-            linear = 0.0
-            preferred_sign = 1.0 if left_clear >= right_clear else -1.0
-            angular = float(preferred_sign * max(0.75 * self.angular_speed_max, abs(angular)))
-            angular = float(np.clip(angular, -self.angular_speed_max, self.angular_speed_max))
+        base_action = self._path_follow_action(
+            relative_dist=relative_dist,
+            relative_angle=relative_angle,
+            front_min=front_min,
+            left_clear=left_clear,
+            right_clear=right_clear,
+        )
 
-        # Mild heading guidance to avoid endless spinning while preserving model behavior.
-        goal_turn = float(np.clip(relative_angle / (math.pi / 2.0), -1.0, 1.0)) * self.angular_speed_max
-        heading_blend = 0.22 if front_min > (self.obstacle_stop_distance + 0.20) else 0.08
-        angular = float((1.0 - heading_blend) * angular + heading_blend * goal_turn)
+        if self.actor is not None:
+            # RL is the primary local planner / avoider.
+            policy_action = np.asarray(
+                self.predict_action(state, relative_dist, relative_angle),
+                dtype=np.float32,
+            )
+            if front_min < self.policy_blend_obstacle_distance:
+                path_assist = self.policy_blend_near_obstacle
+            else:
+                path_assist = self.policy_blend_far
+            path_assist = float(np.clip(path_assist, 0.0, 0.8))
+
+            # When waypoint is stale, rely even more on RL local exploration behavior.
+            if stuck_local and relative_dist > max(0.30, self.waypoint_close_distance):
+                path_assist = min(path_assist, 0.18)
+
+            action = np.clip(
+                (1.0 - path_assist) * policy_action + path_assist * base_action,
+                -1.0,
+                1.0,
+            )
+            rl_weight = 1.0 - path_assist
+        else:
+            action = base_action
+            rl_weight = 0.0
+
+        self.prev_action_norm = action.copy()
+        linear = float((action[0] + 1.0) * 0.5 * self.linear_speed_max)
+        angular = float(action[1] * self.angular_speed_max)
+        angular = float(np.clip(angular, -self.angular_speed_max, self.angular_speed_max))
 
         # Near waypoint: prioritize passing through instead of orbiting in place.
-        if relative_dist < self.waypoint_close_distance:
-            linear = max(linear, min(0.35 * self.linear_speed_max, 0.08))
-            angular = float(
-                np.clip(
-                    0.35 * goal_turn,
-                    -0.45 * self.angular_speed_max,
-                    0.45 * self.angular_speed_max,
-                )
-            )
+        if (
+            relative_dist < self.waypoint_close_distance
+            and front_min > self.obstacle_slow_distance
+            and abs(relative_angle) < 0.9
+        ):
+            # Keep moving through waypoint area, but avoid forced forward push near obstacles.
+            linear = max(linear, min(0.22 * self.linear_speed_max, 0.05))
 
         # If distance-to-waypoint does not improve for several seconds, force exploration turn.
-        stuck_local = self._is_local_stuck(now, relative_dist)
-        if stuck_local and relative_dist > max(0.30, self.waypoint_close_distance):
+        if (
+            self.enable_local_escape
+            and stuck_local
+            and relative_dist > max(0.30, self.waypoint_close_distance)
+        ):
             if abs(left_clear - right_clear) > 0.08:
                 self.escape_turn_sign = 1.0 if left_clear >= right_clear else -1.0
             angular = float(
@@ -259,12 +330,46 @@ class RLLocalDriver(Node):
             )
             linear = min(linear, 0.03 if front_min > (self.obstacle_stop_distance + 0.05) else 0.0)
 
+        # Safety shield: never allow close-wall forward push due to policy or near-waypoint override.
+        if front_min < self.obstacle_hard_stop_distance:
+            linear = 0.0
+            turn_sign = 1.0 if left_clear >= right_clear else -1.0
+            angular = float(
+                np.clip(
+                    turn_sign * max(abs(angular), 0.85 * self.angular_speed_max),
+                    -self.angular_speed_max,
+                    self.angular_speed_max,
+                )
+            )
+        elif front_min < self.obstacle_slow_distance:
+            linear = min(linear, 0.04)
+
+        # Side guard: avoid steering into nearby side wall while squeezing through corridors.
+        if front_left_min < self.side_guard_distance and angular > 0.0:
+            angular = min(
+                angular,
+                -0.22
+                * self.angular_speed_max
+                * float(np.clip((self.side_guard_distance - front_left_min) / self.side_guard_distance, 0.0, 1.0)),
+            )
+        if front_right_min < self.side_guard_distance and angular < 0.0:
+            angular = max(
+                angular,
+                0.22
+                * self.angular_speed_max
+                * float(np.clip((self.side_guard_distance - front_right_min) / self.side_guard_distance, 0.0, 1.0)),
+            )
+        if min(front_left_min, front_right_min) < self.side_guard_distance:
+            linear = min(linear, 0.05)
+
         if (now - self._last_debug_sec) > 1.0:
             self._last_debug_sec = now
             policy_mode = "model" if self.actor is not None else "heuristic"
             self.get_logger().info(
                 f"ctrl[{policy_mode}] | dist={relative_dist:.2f} ang={relative_angle:.2f} "
-                f"front={front_min:.2f} lin={linear:.3f} angz={angular:.3f} stuck_local={stuck_local}"
+                f"front={front_min:.2f} fl={front_left_min:.2f} fr={front_right_min:.2f} "
+                f"lin={linear:.3f} angz={angular:.3f} "
+                f"rl_weight={rl_weight:.2f} stuck_local={stuck_local}"
             )
 
         cmd = Twist()
@@ -283,9 +388,13 @@ class RLLocalDriver(Node):
         """TF transform helper."""
         if pose.header.frame_id == target_frame:
             return pose
+        req = PoseStamped()
+        req.header.frame_id = pose.header.frame_id
+        req.header.stamp = Time().to_msg()  # Use latest TF to avoid stale-time lock.
+        req.pose = pose.pose
         try:
             out = self.tf_buffer.transform(
-                pose,
+                req,
                 target_frame,
                 timeout=Duration(seconds=0.2),
             )
@@ -381,6 +490,58 @@ class RLLocalDriver(Node):
             if abs(relative_angle) > 1.0:
                 linear_cmd = min(linear_cmd, 0.03)
             linear_cmd = float(np.clip(linear_cmd, 0.0, self.linear_speed_max))
+
+        linear_norm = float(np.clip(2.0 * linear_cmd / max(self.linear_speed_max, 1e-3) - 1.0, -1.0, 1.0))
+        angular_norm = float(np.clip(angular_cmd / max(self.angular_speed_max, 1e-3), -1.0, 1.0))
+        return np.array([linear_norm, angular_norm], dtype=np.float32)
+
+    def _path_follow_action(
+        self,
+        relative_dist: float,
+        relative_angle: float,
+        front_min: float,
+        left_clear: float,
+        right_clear: float,
+    ) -> np.ndarray:
+        """Deterministic path-follow action used as the primary controller."""
+        k_heading = 1.35
+        angular_cmd = float(
+            np.clip(
+                k_heading * relative_angle,
+                -self.angular_speed_max,
+                self.angular_speed_max,
+            )
+        )
+
+        inv_l = 1.0 / max(left_clear, 0.05)
+        inv_r = 1.0 / max(right_clear, 0.05)
+        repulsive = float(np.clip(inv_r - inv_l, -1.8, 1.8))
+        avoid_gain = float(np.clip((self.policy_blend_obstacle_distance - front_min) / 0.8, 0.0, 1.0))
+        angular_cmd += 0.55 * avoid_gain * repulsive
+        angular_cmd = float(np.clip(angular_cmd, -self.angular_speed_max, self.angular_speed_max))
+
+        heading_factor = float(np.clip(1.0 - abs(relative_angle) / 1.2, 0.0, 1.0))
+        clearance_factor = float(
+            np.clip(
+                (front_min - self.obstacle_stop_distance) / max(0.9 - self.obstacle_stop_distance, 1e-3),
+                0.0,
+                1.0,
+            )
+        )
+        dist_factor = float(np.clip(relative_dist / 1.2, 0.15, 1.0))
+        linear_cmd = self.linear_speed_max * heading_factor * clearance_factor * dist_factor
+        linear_cmd = float(np.clip(linear_cmd, 0.0, self.linear_speed_max))
+
+        if front_min < (self.obstacle_stop_distance + 0.04):
+            linear_cmd = 0.0
+            turn_sign = 1.0 if left_clear >= right_clear else -1.0
+            angular_cmd = float(
+                np.clip(
+                    turn_sign * max(0.8 * self.angular_speed_max, abs(angular_cmd)),
+                    -self.angular_speed_max,
+                    self.angular_speed_max,
+                )
+            )
 
         linear_norm = float(np.clip(2.0 * linear_cmd / max(self.linear_speed_max, 1e-3) - 1.0, -1.0, 1.0))
         angular_norm = float(np.clip(angular_cmd / max(self.angular_speed_max, 1e-3), -1.0, 1.0))

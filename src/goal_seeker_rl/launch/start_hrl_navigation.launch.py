@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
@@ -31,11 +31,46 @@ def generate_launch_description() -> LaunchDescription:
     planner_waypoint_reached_distance = LaunchConfiguration("planner_waypoint_reached_distance")
     local_waypoint_close_distance = LaunchConfiguration("local_waypoint_close_distance")
     local_waypoint_stop_distance = LaunchConfiguration("local_waypoint_stop_distance")
+    planner_obstacle_inflation_radius_m = LaunchConfiguration("planner_obstacle_inflation_radius_m")
+    planner_frontier_fail_radius_cells = LaunchConfiguration("planner_frontier_fail_radius_cells")
+    planner_frontier_fail_hard_threshold = LaunchConfiguration("planner_frontier_fail_hard_threshold")
+    planner_frontier_fail_hard_radius_cells = LaunchConfiguration("planner_frontier_fail_hard_radius_cells")
+    planner_frontier_goal_heading_weight = LaunchConfiguration("planner_frontier_goal_heading_weight")
+    planner_waypoint_hold_timeout_sec = LaunchConfiguration("planner_waypoint_hold_timeout_sec")
+    policy_blend_far = LaunchConfiguration("policy_blend_far")
+    policy_blend_near_obstacle = LaunchConfiguration("policy_blend_near_obstacle")
+    policy_blend_obstacle_distance = LaunchConfiguration("policy_blend_obstacle_distance")
+    enable_local_escape = LaunchConfiguration("enable_local_escape")
+    local_obstacle_slow_distance = LaunchConfiguration("local_obstacle_slow_distance")
+    local_obstacle_hard_stop_distance = LaunchConfiguration("local_obstacle_hard_stop_distance")
+    local_side_guard_distance = LaunchConfiguration("local_side_guard_distance")
 
     default_world = PathJoinSubstitution(
-        [FindPackageShare("turtlebot3_gazebo"), "worlds", "turtlebot3_houses", "waffle.model"]
+        [FindPackageShare("goal_seeker_rl"), "worlds", "goal_seeker_large_dynamic.world"]
     )
     robot_urdf = PathJoinSubstitution([FindPackageShare("goal_seeker_rl"), "urdf", "turtlebot3_waffle_minimal.urdf"])
+    gazebo_models = PathJoinSubstitution([FindPackageShare("turtlebot3_gazebo"), "models"])
+    gazebo_obstacle_plugins = PathJoinSubstitution(
+        [
+            FindPackageShare("turtlebot3_gazebo"),
+            "models",
+            "turtlebot3_drl_world",
+            "obstacle_plugin",
+            "lib",
+        ]
+    )
+    set_gazebo_model_path = SetEnvironmentVariable(
+        name="GAZEBO_MODEL_PATH",
+        value=[gazebo_models, ":", EnvironmentVariable("GAZEBO_MODEL_PATH", default_value="")],
+    )
+    set_gazebo_plugin_path = SetEnvironmentVariable(
+        name="GAZEBO_PLUGIN_PATH",
+        value=[
+            gazebo_obstacle_plugins,
+            ":",
+            EnvironmentVariable("GAZEBO_PLUGIN_PATH", default_value=""),
+        ],
+    )
 
     gzserver_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -85,12 +120,12 @@ def generate_launch_description() -> LaunchDescription:
             {
                 "use_sim_time": use_sim_time,
                 "lookahead_distance": lookahead_distance,
-                "timer_period_sec": 0.5,
+                "timer_period_sec": 0.25,
                 "stuck_window_sec": 6.0,
                 "stuck_distance_threshold": 0.08,
                 "replan_cooldown_sec": 6.0,
                 "occupancy_obstacle_threshold": 65,
-                "obstacle_inflation_radius_m": 0.24,
+                "obstacle_inflation_radius_m": planner_obstacle_inflation_radius_m,
                 "allow_unknown": True,
                 "unknown_penalty": 2.5,
                 "frontier_search_enabled": True,
@@ -99,12 +134,17 @@ def generate_launch_description() -> LaunchDescription:
                 "frontier_goal_weight": 1.0,
                 "frontier_start_weight": 0.35,
                 "frontier_min_distance": 0.8,
-                "frontier_min_separation": 1.2,
+                "frontier_min_separation": 1.5,
+                "frontier_goal_heading_weight": planner_frontier_goal_heading_weight,
+                "frontier_goal_heading_min_cos": -0.05,
                 "path_smoothing_enabled": True,
                 "path_max_skip_cells": 24,
                 "waypoint_reached_distance": planner_waypoint_reached_distance,
-                "frontier_revisit_weight": 2.6,
-                "frontier_fail_radius_cells": 20,
+                "waypoint_hold_timeout_sec": planner_waypoint_hold_timeout_sec,
+                "frontier_revisit_weight": 3.2,
+                "frontier_fail_radius_cells": planner_frontier_fail_radius_cells,
+                "frontier_fail_hard_threshold": planner_frontier_fail_hard_threshold,
+                "frontier_fail_hard_radius_cells": planner_frontier_fail_hard_radius_cells,
                 "frontier_stagnation_sec": 7.0,
                 "map_topic": "/map",
                 "odom_topic": "/odom",
@@ -142,9 +182,16 @@ def generate_launch_description() -> LaunchDescription:
                 "linear_speed_max": linear_speed_max,
                 "angular_speed_max": angular_speed_max,
                 "waypoint_timeout_sec": 2.0,
-                "obstacle_stop_distance": 0.22,
+                "obstacle_stop_distance": 0.20,
+                "obstacle_slow_distance": local_obstacle_slow_distance,
+                "obstacle_hard_stop_distance": local_obstacle_hard_stop_distance,
+                "side_guard_distance": local_side_guard_distance,
                 "waypoint_close_distance": local_waypoint_close_distance,
                 "waypoint_stop_distance": local_waypoint_stop_distance,
+                "policy_blend_far": policy_blend_far,
+                "policy_blend_near_obstacle": policy_blend_near_obstacle,
+                "policy_blend_obstacle_distance": policy_blend_obstacle_distance,
+                "enable_local_escape": enable_local_escape,
                 "policy_source": local_policy_source,
                 "model_path": local_model_path,
                 "network_variant": local_network_variant,
@@ -175,7 +222,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("world", default_value=default_world),
             DeclareLaunchArgument("lookahead_distance", default_value="1.5"),
             DeclareLaunchArgument("local_scan_samples", default_value="40"),
-            DeclareLaunchArgument("linear_speed_max", default_value="0.22"),
+            DeclareLaunchArgument("linear_speed_max", default_value="0.18"),
             DeclareLaunchArgument("angular_speed_max", default_value="2.0"),
             DeclareLaunchArgument("local_policy_source", default_value="reference_actor"),
             DeclareLaunchArgument(
@@ -187,8 +234,23 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("local_append_prev_action", default_value="true"),
             DeclareLaunchArgument("local_policy_max_goal_distance", default_value="5.94"),
             DeclareLaunchArgument("planner_waypoint_reached_distance", default_value="0.50"),
+            DeclareLaunchArgument("planner_waypoint_hold_timeout_sec", default_value="1.6"),
             DeclareLaunchArgument("local_waypoint_close_distance", default_value="0.50"),
             DeclareLaunchArgument("local_waypoint_stop_distance", default_value="0.18"),
+            DeclareLaunchArgument("planner_obstacle_inflation_radius_m", default_value="0.24"),
+            DeclareLaunchArgument("planner_frontier_fail_radius_cells", default_value="30"),
+            DeclareLaunchArgument("planner_frontier_fail_hard_threshold", default_value="2"),
+            DeclareLaunchArgument("planner_frontier_fail_hard_radius_cells", default_value="30"),
+            DeclareLaunchArgument("planner_frontier_goal_heading_weight", default_value="1.8"),
+            DeclareLaunchArgument("policy_blend_far", default_value="0.08"),
+            DeclareLaunchArgument("policy_blend_near_obstacle", default_value="0.18"),
+            DeclareLaunchArgument("policy_blend_obstacle_distance", default_value="0.80"),
+            DeclareLaunchArgument("enable_local_escape", default_value="true"),
+            DeclareLaunchArgument("local_obstacle_slow_distance", default_value="0.38"),
+            DeclareLaunchArgument("local_obstacle_hard_stop_distance", default_value="0.28"),
+            DeclareLaunchArgument("local_side_guard_distance", default_value="0.24"),
+            set_gazebo_model_path,
+            set_gazebo_plugin_path,
             gzserver_launch,
             gzclient_launch,
             robot_state_publisher,

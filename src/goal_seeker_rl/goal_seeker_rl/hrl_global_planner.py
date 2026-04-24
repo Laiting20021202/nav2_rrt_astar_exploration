@@ -19,6 +19,7 @@ import numpy as np
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
+from rclpy.time import Time
 
 from geometry_msgs.msg import Point, PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
@@ -66,15 +67,30 @@ class HRLGlobalPlanner(Node):
         self.frontier_gain_weight = float(self.get_parameter("frontier_gain_weight").value)
         self.frontier_min_separation = float(self.get_parameter("frontier_min_separation").value)
         self.frontier_revisit_weight = float(self.get_parameter("frontier_revisit_weight").value)
+        self.frontier_goal_heading_weight = float(
+            self.get_parameter("frontier_goal_heading_weight").value
+        )
+        self.frontier_goal_heading_min_cos = float(
+            self.get_parameter("frontier_goal_heading_min_cos").value
+        )
 
         self.frontier_fail_cooldown_sec = float(self.get_parameter("frontier_fail_cooldown_sec").value)
         self.frontier_fail_radius_cells = int(self.get_parameter("frontier_fail_radius_cells").value)
         self.frontier_stagnation_sec = float(self.get_parameter("frontier_stagnation_sec").value)
         self.frontier_progress_epsilon = float(self.get_parameter("frontier_progress_epsilon").value)
+        self.frontier_fail_hard_threshold = int(
+            self.get_parameter("frontier_fail_hard_threshold").value
+        )
+        self.frontier_fail_hard_radius_cells = int(
+            self.get_parameter("frontier_fail_hard_radius_cells").value
+        )
 
         self.path_smoothing_enabled = bool(self.get_parameter("path_smoothing_enabled").value)
         self.path_max_skip_cells = int(self.get_parameter("path_max_skip_cells").value)
         self.waypoint_reached_distance = float(self.get_parameter("waypoint_reached_distance").value)
+        self.waypoint_hold_timeout_sec = float(
+            self.get_parameter("waypoint_hold_timeout_sec").value
+        )
 
         self.publish_waypoint_marker = bool(self.get_parameter("publish_waypoint_marker").value)
         self.waypoint_marker_topic = str(self.get_parameter("waypoint_marker_topic").value)
@@ -107,6 +123,7 @@ class HRLGlobalPlanner(Node):
         self.last_plan_mode = "idle"
         self.path_progress_idx = 0
         self.current_waypoint_idx = 0
+        self.current_waypoint_set_sec = -1e9
 
         self.active_frontier_cell: Optional[Cell] = None
         self.frontier_start_dist_cells = 0.0
@@ -172,15 +189,20 @@ class HRLGlobalPlanner(Node):
         self.declare_parameter("frontier_gain_weight", 0.7)
         self.declare_parameter("frontier_min_separation", 0.9)
         self.declare_parameter("frontier_revisit_weight", 1.8)
+        self.declare_parameter("frontier_goal_heading_weight", 1.2)
+        self.declare_parameter("frontier_goal_heading_min_cos", -0.25)
 
         self.declare_parameter("frontier_fail_cooldown_sec", 90.0)
         self.declare_parameter("frontier_fail_radius_cells", 8)
         self.declare_parameter("frontier_stagnation_sec", 6.0)
         self.declare_parameter("frontier_progress_epsilon", 0.45)
+        self.declare_parameter("frontier_fail_hard_threshold", 3)
+        self.declare_parameter("frontier_fail_hard_radius_cells", 10)
 
         self.declare_parameter("path_smoothing_enabled", True)
         self.declare_parameter("path_max_skip_cells", 24)
         self.declare_parameter("waypoint_reached_distance", 0.45)
+        self.declare_parameter("waypoint_hold_timeout_sec", 2.0)
 
         self.declare_parameter("publish_waypoint_marker", True)
         self.declare_parameter("waypoint_marker_topic", "/hrl_waypoint_marker")
@@ -231,6 +253,7 @@ class HRLGlobalPlanner(Node):
         self.path_cells = []
         self.path_progress_idx = 0
         self.current_waypoint_idx = 0
+        self.current_waypoint_set_sec = -1e9
         self.active_frontier_cell = None
         self.pose_history.clear()
         self._cleanup_frontier_failures(self._now_sec())
@@ -358,6 +381,7 @@ class HRLGlobalPlanner(Node):
         self.last_plan_mode = mode
         self.path_progress_idx = 0
         self.current_waypoint_idx = 0
+        self.current_waypoint_set_sec = -1e9
         self.last_replan_sec = now
 
         self.active_frontier_cell = frontier_cell
@@ -526,13 +550,34 @@ class HRLGlobalPlanner(Node):
         min_sep_cells = int(max(1.0, self.frontier_min_separation / max(resolution, 1e-3)))
         diag = math.hypot(width, height)
         diag = max(diag, 1.0)
+        goal_vec = np.array(
+            [float(goal_cell[0] - start_cell[0]), float(goal_cell[1] - start_cell[1])],
+            dtype=np.float32,
+        )
+        goal_norm = float(np.linalg.norm(goal_vec))
+        if goal_norm > 1e-6:
+            goal_unit = goal_vec / goal_norm
+        else:
+            goal_unit = np.array([1.0, 0.0], dtype=np.float32)
 
         scored: list[tuple[float, Cell]] = []
+        blocked_scored: list[tuple[float, Cell]] = []
         for y, x in frontier_idx:
             cell = (int(x), int(y))
             dist_start = self._heuristic(start_cell, cell)
             if dist_start < float(min_dist_cells):
                 continue
+
+            frontier_vec = np.array(
+                [float(cell[0] - start_cell[0]), float(cell[1] - start_cell[1])],
+                dtype=np.float32,
+            )
+            frontier_norm = float(np.linalg.norm(frontier_vec))
+            if frontier_norm > 1e-6:
+                frontier_unit = frontier_vec / frontier_norm
+                heading_cos = float(np.dot(frontier_unit, goal_unit))
+            else:
+                heading_cos = 0.0
 
             # info gain: unknown cells in local 5x5 patch
             x0 = max(0, cell[0] - 2)
@@ -548,10 +593,18 @@ class HRLGlobalPlanner(Node):
                 self.frontier_goal_weight * (dist_goal / diag)
                 - self.frontier_start_weight * (dist_start / diag)
                 - self.frontier_gain_weight * min(gain / 25.0, 1.0)
+                - self.frontier_goal_heading_weight * max(heading_cos, self.frontier_goal_heading_min_cos)
                 + fail_penalty
                 + revisit_penalty
             )
+            if self._frontier_is_hard_blocked(cell, now):
+                blocked_scored.append((score + 4.0, cell))
+                continue
             scored.append((score, cell))
+
+        # If all candidates are hard-blocked, allow the best blocked options as fallback.
+        if (not scored) and blocked_scored:
+            scored = blocked_scored
 
         scored.sort(key=lambda t: t[0])
         return self._select_diverse_frontiers(scored, min_sep_cells)
@@ -587,6 +640,7 @@ class HRLGlobalPlanner(Node):
         """Pick a forward waypoint using monotonic path progress + arc-length lookahead."""
         if not self.path_world:
             return None
+        now_sec = self._now_sec()
         points = np.asarray(self.path_world, dtype=np.float32)
         robot = np.array([robot_x, robot_y], dtype=np.float32)
         d2 = np.sum((points - robot[None, :]) ** 2, axis=1)
@@ -615,7 +669,25 @@ class HRLGlobalPlanner(Node):
             if accum >= self.lookahead_distance:
                 chosen_idx = i + 1
                 break
-        self.current_waypoint_idx = max(self.current_waypoint_idx, chosen_idx)
+
+        chosen_idx = max(self.current_waypoint_idx, chosen_idx)
+        if chosen_idx != self.current_waypoint_idx:
+            self.current_waypoint_idx = chosen_idx
+            self.current_waypoint_set_sec = now_sec
+        else:
+            if self.current_waypoint_set_sec < -1e8:
+                self.current_waypoint_set_sec = now_sec
+            stale_time = now_sec - self.current_waypoint_set_sec
+            if (
+                stale_time > self.waypoint_hold_timeout_sec
+                and self.current_waypoint_idx < (len(self.path_world) - 1)
+            ):
+                cur_wx, cur_wy = self.path_world[self.current_waypoint_idx]
+                dist_to_cur = math.hypot(cur_wx - robot_x, cur_wy - robot_y)
+                if dist_to_cur > (1.2 * self.waypoint_reached_distance):
+                    self.current_waypoint_idx += 1
+                    self.current_waypoint_set_sec = now_sec
+        chosen_idx = self.current_waypoint_idx
 
         wx, wy = self.path_world[chosen_idx]
         msg = PoseStamped()
@@ -757,9 +829,13 @@ class HRLGlobalPlanner(Node):
         """Transform pose into target frame using TF."""
         if pose.header.frame_id == target_frame:
             return pose
+        req = PoseStamped()
+        req.header.frame_id = pose.header.frame_id
+        req.header.stamp = Time().to_msg()  # Use latest TF to avoid stale-time lock.
+        req.pose = pose.pose
         try:
             out = self.tf_buffer.transform(
-                pose,
+                req,
                 target_frame,
                 timeout=Duration(seconds=0.2),
             )
@@ -861,6 +937,21 @@ class HRLGlobalPlanner(Node):
             freshness = 1.0 - (age / max(self.frontier_fail_cooldown_sec, 1e-3))
             penalty += float(count) * 0.8 * locality * freshness
         return penalty
+
+    def _frontier_is_hard_blocked(self, cell: Cell, now_sec: float) -> bool:
+        """Return True when frontier should be temporarily excluded as dead-zone."""
+        if not self.frontier_failures:
+            return False
+        hard_radius = max(1, self.frontier_fail_hard_radius_cells)
+        for failed_cell, (count, t_fail) in self.frontier_failures.items():
+            if count < self.frontier_fail_hard_threshold:
+                continue
+            age = now_sec - t_fail
+            if age > self.frontier_fail_cooldown_sec:
+                continue
+            if self._heuristic(cell, failed_cell) <= float(hard_radius):
+                return True
+        return False
 
     def _frontier_revisit_penalty(self, cell: Cell) -> float:
         """Penalty term for frequently revisited areas near the frontier."""
