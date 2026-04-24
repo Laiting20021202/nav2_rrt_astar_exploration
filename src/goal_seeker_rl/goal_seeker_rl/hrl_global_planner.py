@@ -75,6 +75,9 @@ class HRLGlobalPlanner(Node):
         self.frontier_goal_heading_min_cos = float(
             self.get_parameter("frontier_goal_heading_min_cos").value
         )
+        self.frontier_goal_progress_min_m = float(
+            self.get_parameter("frontier_goal_progress_min_m").value
+        )
 
         self.frontier_fail_cooldown_sec = float(self.get_parameter("frontier_fail_cooldown_sec").value)
         self.frontier_fail_radius_cells = int(self.get_parameter("frontier_fail_radius_cells").value)
@@ -184,7 +187,7 @@ class HRLGlobalPlanner(Node):
         self.declare_parameter("local_waypoint_topic", "/hrl_local_waypoint")
         self.declare_parameter("global_path_topic", "/hrl_global_path")
         self.declare_parameter("map_frame", "map")
-        self.declare_parameter("waypoint_publish_frame", "odom")
+        self.declare_parameter("waypoint_publish_frame", "map")
 
         self.declare_parameter("lookahead_distance", 1.0)
         self.declare_parameter("timer_period_sec", 0.5)
@@ -209,6 +212,7 @@ class HRLGlobalPlanner(Node):
         self.declare_parameter("frontier_revisit_weight", 1.8)
         self.declare_parameter("frontier_goal_heading_weight", 1.2)
         self.declare_parameter("frontier_goal_heading_min_cos", -0.25)
+        self.declare_parameter("frontier_goal_progress_min_m", 0.8)
 
         self.declare_parameter("frontier_fail_cooldown_sec", 90.0)
         self.declare_parameter("frontier_fail_radius_cells", 8)
@@ -619,9 +623,13 @@ class HRLGlobalPlanner(Node):
             goal_unit = goal_vec / goal_norm
         else:
             goal_unit = np.array([1.0, 0.0], dtype=np.float32)
+        start_goal_dist = self._heuristic(start_cell, goal_cell)
+        progress_min_cells = self._meter_to_cells(self.frontier_goal_progress_min_m)
 
         scored: list[tuple[float, Cell]] = []
         blocked_scored: list[tuple[float, Cell]] = []
+        scored_progressive: list[tuple[float, Cell]] = []
+        blocked_progressive: list[tuple[float, Cell]] = []
         for y, x in frontier_idx:
             cell = (int(x), int(y))
             dist_start = self._heuristic(start_cell, cell)
@@ -661,10 +669,20 @@ class HRLGlobalPlanner(Node):
                 + fail_penalty
                 + revisit_penalty
             )
+            makes_goal_progress = dist_goal <= (start_goal_dist - progress_min_cells)
             if self._frontier_is_hard_blocked(cell, now):
                 blocked_scored.append((score + 4.0, cell))
+                if makes_goal_progress:
+                    blocked_progressive.append((score + 4.0, cell))
                 continue
             scored.append((score, cell))
+            if makes_goal_progress:
+                scored_progressive.append((score, cell))
+
+        # Prefer frontiers that strictly reduce distance to final goal.
+        if scored_progressive:
+            scored = scored_progressive
+            blocked_scored = blocked_progressive
 
         # If all candidates are hard-blocked, allow the best blocked options as fallback.
         if (not scored) and blocked_scored:
@@ -747,7 +765,7 @@ class HRLGlobalPlanner(Node):
             heading = math.atan2(wy - robot_y, wx - robot_x)
             heading_raw = self._normalize_angle(heading - robot_yaw)
             # Avoid selecting far waypoints that require near U-turns.
-            if abs(heading_raw) > 2.7 and accum > (min_arc + 0.4):
+            if abs(heading_raw) > 2.2 and accum > (min_arc + 0.3):
                 continue
             heading_err = abs(heading_raw) / math.pi
             heading_term = -self.waypoint_heading_weight * heading_err
@@ -768,6 +786,19 @@ class HRLGlobalPlanner(Node):
         else:
             candidates.sort(key=lambda t: t[0], reverse=True)
             chosen_idx = candidates[0][1]
+
+        # If current waypoint is already behind robot and nearby, advance it to prevent orbiting.
+        if 0 <= self.current_waypoint_idx < len(self.path_world):
+            cw_x, cw_y = self.path_world[self.current_waypoint_idx]
+            cw_dist = math.hypot(cw_x - robot_x, cw_y - robot_y)
+            cw_heading = math.atan2(cw_y - robot_y, cw_x - robot_x)
+            cw_heading_err = abs(self._normalize_angle(cw_heading - robot_yaw))
+            if (
+                cw_dist < (1.8 * self.waypoint_reached_distance)
+                and cw_heading_err > 1.9
+                and self.current_waypoint_idx < (len(self.path_world) - 1)
+            ):
+                chosen_idx = max(chosen_idx, self.current_waypoint_idx + 1)
 
         # If a waypoint stays too long and still not reached, advance one step.
         if chosen_idx == self.current_waypoint_idx:
