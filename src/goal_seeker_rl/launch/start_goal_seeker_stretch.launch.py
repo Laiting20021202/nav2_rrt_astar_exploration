@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
@@ -62,6 +64,19 @@ def generate_launch_description() -> LaunchDescription:
     rviz_config = LaunchConfiguration("rviz_config")
 
     default_rviz = PathJoinSubstitution([FindPackageShare("goal_seeker_rl"), "rviz", "stretch_nav_config.rviz"])
+    default_workspace = os.environ.get("RL_BASE_WS", "/home/david/Desktop/laiting/rl_base_navigation")
+    default_model_dir = os.environ.get("RL_BASE_MODEL_DIR", os.path.join(default_workspace, "navigation_model"))
+    default_reference_actor = os.path.join(
+        default_workspace,
+        "reference",
+        "turtlebot3_drlnav",
+        "src",
+        "turtlebot3_drl",
+        "model",
+        "examples",
+        "ddpg_0_stage9",
+        "actor_stage9_episode8000.pt",
+    )
 
     stretch_sim_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -166,7 +181,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("model_path", default_value=""),
             DeclareLaunchArgument(
                 "reference_actor_path",
-                default_value="/home/david/Desktop/laiting/rl_base_navigation/reference/turtlebot3_drlnav/src/turtlebot3_drl/model/examples/ddpg_0_stage9/actor_stage9_episode8000.pt",
+                default_value=default_reference_actor,
             ),
             DeclareLaunchArgument("reference_state_scan_samples", default_value="40"),
             DeclareLaunchArgument("state_scan_samples", default_value="40"),
@@ -174,7 +189,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("network_variant", default_value="reference"),
             DeclareLaunchArgument(
                 "bootstrap_actor_path",
-                default_value="/home/david/Desktop/laiting/rl_base_navigation/reference/turtlebot3_drlnav/src/turtlebot3_drl/model/examples/ddpg_0_stage9/actor_stage9_episode8000.pt",
+                default_value=default_reference_actor,
             ),
             DeclareLaunchArgument("bootstrap_actor_strict", default_value="true"),
             DeclareLaunchArgument("resume_model_path", default_value=""),
@@ -209,7 +224,7 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("checkpoint_interval_steps", default_value="2000"),
             DeclareLaunchArgument(
                 "checkpoint_dir",
-                default_value="/home/david/Desktop/laiting/rl_base_navigation/src/goal_seeker_rl/model",
+                default_value=default_model_dir,
             ),
             DeclareLaunchArgument("rviz_config", default_value=default_rviz),
             stretch_sim_launch,

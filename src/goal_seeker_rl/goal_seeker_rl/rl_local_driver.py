@@ -1,7 +1,7 @@
 """Hierarchical RL local driver node.
 
 This node acts as the local driver:
-1) Read LiDAR from `/scan`.
+1) Read the Realsense-derived LaserScan from `/scan`.
 2) Read FAR-style tactical waypoint from `/hrl_local_waypoint`.
 3) Convert waypoint into base_link-relative distance/angle.
 4) Run RL policy inference for local obstacle avoidance + local planning.
@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from collections import deque
 import math
+import os
 from typing import Deque, Optional
 
 import numpy as np
@@ -22,6 +23,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 
 from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import Path
 from sensor_msgs.msg import LaserScan
 from std_msgs.msg import Bool
 from tf2_geometry_msgs import do_transform_pose_stamped
@@ -77,6 +79,26 @@ class RLLocalDriver(Node):
             self.get_parameter("policy_blend_obstacle_distance").value
         )
         self.enable_local_escape = bool(self.get_parameter("enable_local_escape").value)
+        self.publish_rl_path = bool(self.get_parameter("publish_rl_path").value)
+        self.rl_path_topic = str(self.get_parameter("rl_path_topic").value)
+        self.rl_path_frame = str(self.get_parameter("rl_path_frame").value)
+        self.rl_path_horizon_steps = int(self.get_parameter("rl_path_horizon_steps").value)
+        self.rl_path_dt_sec = float(self.get_parameter("rl_path_dt_sec").value)
+        self.lookaround_enabled = bool(self.get_parameter("lookaround_enabled").value)
+        self.lookaround_front_distance = float(self.get_parameter("lookaround_front_distance").value)
+        self.lookaround_clear_distance = float(self.get_parameter("lookaround_clear_distance").value)
+        self.lookaround_turn_speed = float(self.get_parameter("lookaround_turn_speed").value)
+        self.lookaround_duration_sec = float(self.get_parameter("lookaround_duration_sec").value)
+        self.lookaround_min_duration_sec = float(self.get_parameter("lookaround_min_duration_sec").value)
+        self.lookaround_cooldown_sec = float(self.get_parameter("lookaround_cooldown_sec").value)
+        self.waiting_scan_creep_enabled = bool(
+            self.get_parameter("waiting_scan_creep_enabled").value
+        )
+        self.waiting_scan_creep_speed = float(self.get_parameter("waiting_scan_creep_speed").value)
+        self.waiting_scan_turn_speed = float(self.get_parameter("waiting_scan_turn_speed").value)
+        self.waiting_scan_front_clearance = float(
+            self.get_parameter("waiting_scan_front_clearance").value
+        )
 
         self.policy_source = str(self.get_parameter("policy_source").value).lower()
         self.model_path = str(self.get_parameter("model_path").value)
@@ -105,6 +127,10 @@ class RLLocalDriver(Node):
         self.prev_action_norm = np.zeros(2, dtype=np.float32)
         self.waypoint_progress: Deque[tuple[float, float]] = deque()
         self.escape_turn_sign = 1.0
+        self.lookaround_until_sec = -1e9
+        self.lookaround_started_sec = -1e9
+        self.lookaround_cooldown_until_sec = -1e9
+        self.lookaround_turn_sign = 1.0
 
         self.device = torch.device("cuda" if (self.use_cuda and torch.cuda.is_available()) else "cpu")
         self.actor: Optional[torch.nn.Module] = None
@@ -114,6 +140,7 @@ class RLLocalDriver(Node):
         self.create_subscription(PoseStamped, self.waypoint_topic, self._waypoint_callback, 10)
         self.create_subscription(Bool, self.goal_active_topic, self._goal_active_callback, 10)
         self.cmd_pub = self.create_publisher(Twist, self.cmd_vel_topic, 10)
+        self.rl_path_pub = self.create_publisher(Path, self.rl_path_topic, 1) if self.publish_rl_path else None
         self.create_timer(max(1e-3, 1.0 / self.control_rate_hz), self._control_loop)
 
         self.get_logger().info(
@@ -122,6 +149,10 @@ class RLLocalDriver(Node):
 
     def _declare_parameters(self) -> None:
         """Declare ROS parameters used by this node."""
+        default_workspace = os.environ.get("RL_BASE_WS", "/home/david/Desktop/laiting/rl_base_navigation")
+        default_model_dir = os.environ.get("RL_BASE_MODEL_DIR", os.path.join(default_workspace, "navigation_model"))
+        default_model_path = os.path.join(default_model_dir, "td3_latest.pth")
+
         self.declare_parameter("scan_topic", "/scan")
         self.declare_parameter("waypoint_topic", "/hrl_local_waypoint")
         self.declare_parameter("goal_active_topic", "/hrl_goal_active")
@@ -151,10 +182,26 @@ class RLLocalDriver(Node):
         self.declare_parameter("policy_blend_near_obstacle", 0.40)
         self.declare_parameter("policy_blend_obstacle_distance", 0.70)
         self.declare_parameter("enable_local_escape", False)
+        self.declare_parameter("publish_rl_path", True)
+        self.declare_parameter("rl_path_topic", "/rl_model_path")
+        self.declare_parameter("rl_path_frame", "base_link")
+        self.declare_parameter("rl_path_horizon_steps", 28)
+        self.declare_parameter("rl_path_dt_sec", 0.20)
+        self.declare_parameter("lookaround_enabled", True)
+        self.declare_parameter("lookaround_front_distance", 0.75)
+        self.declare_parameter("lookaround_clear_distance", 1.10)
+        self.declare_parameter("lookaround_turn_speed", 0.75)
+        self.declare_parameter("lookaround_duration_sec", 1.30)
+        self.declare_parameter("lookaround_min_duration_sec", 0.45)
+        self.declare_parameter("lookaround_cooldown_sec", 0.80)
+        self.declare_parameter("waiting_scan_creep_enabled", True)
+        self.declare_parameter("waiting_scan_creep_speed", 0.06)
+        self.declare_parameter("waiting_scan_turn_speed", 0.35)
+        self.declare_parameter("waiting_scan_front_clearance", 1.0)
 
         # RL policy settings.
-        self.declare_parameter("policy_source", "reference_actor")
-        self.declare_parameter("model_path", "/home/david/Desktop/laiting/rl_base_navigation/reference/turtlebot3_drlnav/src/turtlebot3_drl/model/examples/ddpg_0_stage9/actor_stage9_episode8000.pt")
+        self.declare_parameter("policy_source", "td3")
+        self.declare_parameter("model_path", default_model_path)
         self.declare_parameter("network_variant", "reference")
         self.declare_parameter("hidden_dim", 512)
         self.declare_parameter("model_strict", False)
@@ -195,7 +242,7 @@ class RLLocalDriver(Node):
             )
 
     def _scan_callback(self, msg: LaserScan) -> None:
-        """Downsample scan into fixed-size LiDAR feature vector."""
+        """Downsample scan into fixed-size range feature vector."""
         if not msg.ranges:
             return
         ranges = np.asarray(msg.ranges, dtype=np.float32)
@@ -252,11 +299,14 @@ class RLLocalDriver(Node):
         if (not self.goal_active) or ((now - self.goal_active_recv_sec) > self.goal_active_timeout_sec):
             self._publish_stop()
             return
-        if (not self.has_scan) or (self.latest_waypoint is None):
+        if not self.has_scan:
             self._publish_stop()
             return
+        if self.latest_waypoint is None:
+            self._publish_waiting_lookaround(now)
+            return
         if (now - self.latest_waypoint_recv_sec) > self.waypoint_timeout_sec:
-            self._publish_stop()
+            self._publish_waiting_lookaround(now)
             return
 
         rel = self._waypoint_in_base_frame(self.latest_waypoint)
@@ -269,7 +319,6 @@ class RLLocalDriver(Node):
         self._update_waypoint_progress(now, relative_dist)
         stuck_local = self._is_local_stuck(now, relative_dist)
 
-        # Waypoint already reached: wait for planner to roll forward.
         if relative_dist < self.waypoint_stop_distance:
             self._publish_stop()
             return
@@ -288,6 +337,10 @@ class RLLocalDriver(Node):
         front_right_min = self._sector_min(-80.0, -15.0)
         left_clear = self._sector_mean(40.0, 120.0)
         right_clear = self._sector_mean(-120.0, -40.0)
+
+        if self._publish_lookaround_if_needed(now, front_wide_min, left_clear, right_clear, relative_dist):
+            return
+
         base_action = self._path_follow_action(
             relative_dist=relative_dist,
             relative_angle=relative_angle,
@@ -297,20 +350,18 @@ class RLLocalDriver(Node):
         )
 
         if self.actor is not None:
-            # RL is the primary local planner / avoider.
             policy_action = np.asarray(
                 self.predict_action(state, relative_dist, relative_angle),
                 dtype=np.float32,
             )
-            if front_min < self.policy_blend_obstacle_distance:
+            # 強化轉圈時的路徑跟隨權重
+            if stuck_local:
+                path_assist = 0.50  # 提升至 50%，讓路徑跟隨更主導
+            elif front_min < self.policy_blend_obstacle_distance:
                 path_assist = self.policy_blend_near_obstacle
             else:
                 path_assist = self.policy_blend_far
             path_assist = float(np.clip(path_assist, 0.0, 0.8))
-
-            # When waypoint is stale, rely even more on RL local exploration behavior.
-            if stuck_local and relative_dist > max(0.30, self.waypoint_close_distance):
-                path_assist = min(path_assist, 0.18)
 
             action = np.clip(
                 (1.0 - path_assist) * policy_action + path_assist * base_action,
@@ -327,12 +378,12 @@ class RLLocalDriver(Node):
         angular = float(action[1] * self.angular_speed_max)
         angular = float(np.clip(angular, -self.angular_speed_max, self.angular_speed_max))
 
-        # Do not keep pushing forward when heading error is large; rotate decisively.
+        # 強化旋轉限制：大幅降低無謂轉向
         if abs(relative_angle) > self.turn_in_place_angle:
-            linear = min(linear, 0.03 if front_min > (self.obstacle_stop_distance + 0.06) else 0.0)
+            linear = min(linear, 0.02)
             angular = float(
                 np.clip(
-                    math.copysign(max(abs(angular), 0.75 * self.angular_speed_max), relative_angle),
+                    math.copysign(max(abs(angular), 0.65 * self.angular_speed_max), relative_angle),
                     -self.angular_speed_max,
                     self.angular_speed_max,
                 )
@@ -377,12 +428,12 @@ class RLLocalDriver(Node):
 
         turn_sign = 1.0 if left_clear >= right_clear else -1.0
 
-        # Safety shield: raw-scan emergency and proactive avoidance override RL output.
+        # Safety shield + 轉圈逃脫
         if min(front_min, front_wide_min) < self.emergency_stop_distance:
             linear = 0.0
             angular = float(
                 np.clip(
-                    turn_sign * max(abs(angular), 0.98 * self.angular_speed_max),
+                    turn_sign * max(abs(angular), 0.95 * self.angular_speed_max),
                     -self.angular_speed_max,
                     self.angular_speed_max,
                 )
@@ -449,17 +500,15 @@ class RLLocalDriver(Node):
             self._last_debug_sec = now
             policy_mode = "model" if self.actor is not None else "heuristic"
             self.get_logger().info(
-                f"ctrl[{policy_mode}] | dist={relative_dist:.2f} ang={relative_angle:.2f} "
-                f"front={front_min:.2f} front_w={front_wide_min:.2f} "
-                f"fl={front_left_min:.2f} fr={front_right_min:.2f} "
-                f"lin={linear:.3f} angz={angular:.3f} "
-                f"rl_weight={rl_weight:.2f} stuck_local={stuck_local} goal_active={self.goal_active}"
+                f"LOCAL | policy={policy_mode} dist={relative_dist:.2f} ang={relative_angle:.2f} "
+                f"front={front_min:.2f} stuck={stuck_local} lin={linear:.3f} ang={angular:.3f}"
             )
 
         cmd = Twist()
         cmd.linear.x = linear
         cmd.angular.z = angular
         self.cmd_pub.publish(cmd)
+        self._publish_rl_path(linear, angular)
 
     def _waypoint_in_base_frame(self, waypoint: PoseStamped) -> Optional[tuple[float, float]]:
         """Transform waypoint pose into base_link and return (x, y)."""
@@ -667,6 +716,152 @@ class RLLocalDriver(Node):
         if not np.any(mask):
             return self.lidar_max_range
         return float(np.mean(ranges[mask]))
+
+    def _publish_lookaround_if_needed(
+        self,
+        now_sec: float,
+        front_clear: float,
+        left_clear: float,
+        right_clear: float,
+        relative_dist: float,
+    ) -> bool:
+        """Rotate in place briefly so the narrow Realsense FOV can inspect both sides."""
+        if not self.lookaround_enabled or relative_dist < self.waypoint_close_distance:
+            return False
+
+        still_active = now_sec < self.lookaround_until_sec
+        active_elapsed = now_sec - self.lookaround_started_sec
+        if still_active:
+            if front_clear >= self.lookaround_clear_distance and active_elapsed >= self.lookaround_min_duration_sec:
+                self.lookaround_until_sec = -1e9
+                self.lookaround_cooldown_until_sec = now_sec + self.lookaround_cooldown_sec
+                return False
+            self._publish_lookaround_turn(front_clear)
+            return True
+
+        if now_sec < self.lookaround_cooldown_until_sec:
+            return False
+        if front_clear >= self.lookaround_front_distance:
+            return False
+
+        if abs(left_clear - right_clear) > 0.05:
+            self.lookaround_turn_sign = 1.0 if left_clear >= right_clear else -1.0
+        else:
+            self.lookaround_turn_sign *= -1.0
+        self.lookaround_started_sec = now_sec
+        self.lookaround_until_sec = now_sec + self.lookaround_duration_sec
+        self._publish_lookaround_turn(front_clear)
+        return True
+
+    def _publish_lookaround_turn(self, front_clear: float) -> None:
+        """Publish a short in-place scan turn and blue local arc."""
+        angular = float(np.clip(self.lookaround_turn_sign * self.lookaround_turn_speed, -self.angular_speed_max, self.angular_speed_max))
+        cmd = Twist()
+        cmd.angular.z = angular
+        self.cmd_pub.publish(cmd)
+        self.prev_action_norm = np.array([-1.0, angular / max(self.angular_speed_max, 1e-3)], dtype=np.float32)
+        self._publish_rl_path(0.0, angular)
+        if (self._now_sec() - self._last_debug_sec) > 1.0:
+            self._last_debug_sec = self._now_sec()
+            self.get_logger().info(f"LOCAL look-around | front={front_clear:.2f} ang={angular:.2f}")
+
+    def _publish_waiting_lookaround(self, now_sec: float) -> None:
+        """Keep scanning while the global planner is waiting for enough map to publish a waypoint."""
+        if not self.lookaround_enabled:
+            self._publish_stop()
+            return
+        if now_sec >= self.lookaround_until_sec:
+            self.lookaround_turn_sign *= -1.0
+            self.lookaround_started_sec = now_sec
+            self.lookaround_until_sec = now_sec + self.lookaround_duration_sec
+        front_clear = self._sector_min(-35.0, 35.0)
+        self._publish_waiting_scan_motion(front_clear)
+
+    def _publish_waiting_scan_motion(self, front_clear: float) -> None:
+        """Bootstrap SLAM with a slow safe arc when no global waypoint exists yet."""
+        angular = float(
+            np.clip(
+                self.lookaround_turn_sign * self.waiting_scan_turn_speed,
+                -self.angular_speed_max,
+                self.angular_speed_max,
+            )
+        )
+        linear = 0.0
+        if self.waiting_scan_creep_enabled and front_clear >= self.waiting_scan_front_clearance:
+            linear = float(np.clip(self.waiting_scan_creep_speed, 0.0, self.linear_speed_max))
+
+        cmd = Twist()
+        cmd.linear.x = linear
+        cmd.angular.z = angular
+        self.cmd_pub.publish(cmd)
+        self.prev_action_norm = np.array(
+            [
+                (linear / max(self.linear_speed_max, 1e-3)) * 2.0 - 1.0,
+                angular / max(self.angular_speed_max, 1e-3),
+            ],
+            dtype=np.float32,
+        )
+        self._publish_rl_path(linear, angular)
+        if (self._now_sec() - self._last_debug_sec) > 1.0:
+            self._last_debug_sec = self._now_sec()
+            self.get_logger().info(
+                f"LOCAL map bootstrap | front={front_clear:.2f} lin={linear:.2f} ang={angular:.2f}"
+            )
+
+    def _publish_rl_path(self, linear: float, angular: float) -> None:
+        """Publish a short base_link-frame local rollout for RViz."""
+        if self.rl_path_pub is None:
+            return
+
+        steps = max(1, self.rl_path_horizon_steps)
+        dt = max(0.02, self.rl_path_dt_sec)
+        x = 0.0
+        y = 0.0
+        yaw = 0.0
+        stamp = self.get_clock().now().to_msg()
+        path = Path()
+        path.header.frame_id = self.rl_path_frame
+        path.header.stamp = stamp
+
+        for _ in range(steps + 1):
+            pose = PoseStamped()
+            pose.header.frame_id = self.rl_path_frame
+            pose.header.stamp = stamp
+            pose.pose.position.x = x
+            pose.pose.position.y = y
+            pose.pose.position.z = 0.03
+            pose.pose.orientation.z = math.sin(0.5 * yaw)
+            pose.pose.orientation.w = math.cos(0.5 * yaw)
+            path.poses.append(pose)
+
+            next_x = x + linear * math.cos(yaw) * dt
+            next_y = y + linear * math.sin(yaw) * dt
+            if not self._local_rollout_has_clearance(next_x, next_y):
+                break
+            x = next_x
+            y = next_y
+            yaw = math.atan2(math.sin(yaw + angular * dt), math.cos(yaw + angular * dt))
+
+        self.rl_path_pub.publish(path)
+
+    def _local_rollout_has_clearance(self, x: float, y: float) -> bool:
+        """Check a base_link-frame rollout point against the current Realsense scan."""
+        distance = math.hypot(x, y)
+        if distance <= 0.02:
+            return True
+        angle = math.atan2(y, x)
+        ranges = self.raw_scan_ranges if self.raw_scan_ranges.size > 0 else self.latest_scan_ranges
+        angles = self.raw_scan_angles if self.raw_scan_angles.size > 0 else self.latest_scan_angles
+        if ranges.size == 0 or ranges.size != angles.size:
+            return True
+        diff = np.abs(np.arctan2(np.sin(angles - angle), np.cos(angles - angle)))
+        mask = diff <= math.radians(8.0)
+        if not np.any(mask):
+            idx = int(np.argmin(diff))
+            clearance = float(ranges[idx])
+        else:
+            clearance = float(np.percentile(ranges[mask], 20.0))
+        return (distance + max(0.35, self.obstacle_stop_distance)) <= clearance
 
     def _publish_stop(self) -> None:
         """Publish zero velocity and clear previous action memory."""

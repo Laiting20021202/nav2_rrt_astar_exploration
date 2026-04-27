@@ -156,6 +156,7 @@ class HRLGlobalPlanner(Node):
         self.last_replan_sec = -1e9
         self.pose_history: Deque[tuple[float, float, float]] = deque()
         self._last_tf_warn_sec = -1e9
+        self._last_plan_warn_sec = -1e9
 
         self.create_subscription(OccupancyGrid, self.map_topic, self._map_callback, 10)
         self.create_subscription(Odometry, self.odom_topic, self._odom_callback, 10)
@@ -379,6 +380,8 @@ class HRLGlobalPlanner(Node):
             if (not replanned) and (not self.path_world):
                 return
 
+        self._publish_debug_path()
+
         waypoint = self._extract_best_waypoint(robot_pose_map)
         if waypoint is None:
             if not self._replan(force=True):
@@ -427,7 +430,7 @@ class HRLGlobalPlanner(Node):
         if goal_cell is None:
             goal_cell = self._world_to_map_clamped(*goal_xy)
         if start_cell is None or goal_cell is None:
-            self.get_logger().warn("Start/goal is outside map bounds. Cannot plan.")
+            self._warn_plan_throttled("Start/goal is outside map bounds. Cannot plan.")
             return False
 
         start_cell = self._nearest_navigable_cell(start_cell, allow_unknown=False, max_radius=8)
@@ -441,7 +444,7 @@ class HRLGlobalPlanner(Node):
             if goal_clamped is not None:
                 goal_cell = self._nearest_navigable_cell(goal_clamped, allow_unknown=True, max_radius=20)
         if start_cell is None or goal_cell is None:
-            self.get_logger().warn("Cannot find valid start/goal cell for planning.")
+            self._warn_plan_throttled("Cannot find valid start/goal cell for planning.")
             return False
 
         path_cells, mode, frontier_cell = self._plan_far_like(
@@ -455,7 +458,9 @@ class HRLGlobalPlanner(Node):
             self.path_world = []
             self.last_plan_mode = "failed"
             self.active_frontier_cell = None
-            self.get_logger().warn("Global planner failed: no known/attemptable/frontier route found.")
+            self._warn_plan_throttled(
+                "Global planner failed: no known/attemptable/frontier route found."
+            )
             return False
 
         if self.path_smoothing_enabled:
@@ -1115,6 +1120,14 @@ class HRLGlobalPlanner(Node):
         out.header.stamp = tf.header.stamp
         out.header.frame_id = target_frame
         return out
+
+    def _warn_plan_throttled(self, message: str, period_sec: float = 2.0) -> None:
+        """Throttle repeated planning warnings while SLAM is still initializing."""
+        now = self._now_sec()
+        if (now - self._last_plan_warn_sec) < period_sec:
+            return
+        self._last_plan_warn_sec = now
+        self.get_logger().warn(message)
 
     def _update_pose_history(self, now_sec: float, x: float, y: float) -> None:
         """Store recent positions for stuck detection."""

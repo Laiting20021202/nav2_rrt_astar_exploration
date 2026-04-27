@@ -1,4 +1,4 @@
-"""Environment logic for LiDAR-based goal navigation."""
+"""Environment logic for depth-scan-based goal navigation."""
 
 from __future__ import annotations
 
@@ -53,6 +53,14 @@ class GoalSeekerEnvironment:
         dead_end_side_min_angle_deg: float = 45.0,
         dead_end_side_max_angle_deg: float = 140.0,
         dead_end_revisit_gate: float = 0.5,
+        goal_reward: float = 100.0,
+        collision_penalty: float = -100.0,
+        stuck_penalty: float = -30.0,
+        progress_reward_scale: float = 10.0,
+        forward_reward_scale: float = 0.5,
+        angular_penalty_scale: float = 0.5,
+        obstacle_penalty_scale: float = 0.5,
+        time_penalty: float = 0.01,
     ) -> None:
         self.lidar_samples = lidar_samples
         self.lidar_max_range = lidar_max_range
@@ -80,6 +88,14 @@ class GoalSeekerEnvironment:
         self.dead_end_side_min_angle_rad = math.radians(dead_end_side_min_angle_deg)
         self.dead_end_side_max_angle_rad = math.radians(dead_end_side_max_angle_deg)
         self.dead_end_revisit_gate = dead_end_revisit_gate
+        self.goal_reward = goal_reward
+        self.collision_penalty = collision_penalty
+        self.stuck_penalty = stuck_penalty
+        self.progress_reward_scale = progress_reward_scale
+        self.forward_reward_scale = forward_reward_scale
+        self.angular_penalty_scale = angular_penalty_scale
+        self.obstacle_penalty_scale = obstacle_penalty_scale
+        self.time_penalty = time_penalty
 
         self.robot_x = 0.0
         self.robot_y = 0.0
@@ -107,7 +123,7 @@ class GoalSeekerEnvironment:
 
     @property
     def state_dim(self) -> int:
-        """Return size of state vector: 24 LiDAR + distance + heading."""
+        """Return size of state vector: scan samples + distance + heading."""
         return self.lidar_samples + 2
 
     def set_goal(self, x: float, y: float, now_sec: float) -> None:
@@ -154,7 +170,7 @@ class GoalSeekerEnvironment:
         self._trim_history(now_sec)
 
     def update_scan(self, msg: LaserScan) -> None:
-        """Update normalized LiDAR state and minimum obstacle distance."""
+        """Update normalized scan state and minimum obstacle distance."""
         if not msg.ranges:
             return
 
@@ -184,13 +200,13 @@ class GoalSeekerEnvironment:
         self.has_scan = True
 
     def compute_state(self) -> np.ndarray:
-        """Build state vector from LiDAR + relative goal polar coordinates."""
+        """Build state vector from range scan + relative goal polar coordinates."""
         goal_distance, heading = self._goal_metrics()
         distance_norm = float(np.clip(goal_distance / self.max_goal_distance, 0.0, 1.0))
         heading_norm = float(np.clip(heading / math.pi, -1.0, 1.0))
         return np.concatenate([self.scan_norm, np.array([distance_norm, heading_norm], dtype=np.float32)])
 
-    def evaluate_step(self, now_sec: float) -> StepResult:
+    def evaluate_step(self, now_sec: float, previous_action: Optional[np.ndarray] = None) -> StepResult:
         """Evaluate reward and termination flags for the current observation."""
         self._trim_history(now_sec)
         state = self.compute_state()
@@ -216,22 +232,32 @@ class GoalSeekerEnvironment:
         else:
             self.last_revisit_ratio = 0.0
 
-        # Approach bonus: +100 * (D_{t-1} - D_t), only when moving closer.
-        if self.previous_goal_distance is not None and goal_distance < self.previous_goal_distance:
-            reward += 100.0 * (self.previous_goal_distance - goal_distance)
+        if self.previous_goal_distance is not None:
+            reward += self.progress_reward_scale * (self.previous_goal_distance - goal_distance)
 
         if goal_distance <= self.goal_tolerance:
-            reward += 1000.0
+            reward += self.goal_reward
             done = True
             reason = "goal"
         elif self.min_obstacle_distance <= self.collision_distance:
-            reward -= 500.0
+            reward += self.collision_penalty
             done = True
             reason = "collision"
         else:
+            reward -= self.time_penalty
+            if previous_action is not None:
+                action = np.asarray(previous_action, dtype=np.float32)
+                if action.size >= 2:
+                    linear_norm = float(np.clip((float(action[0]) + 1.0) * 0.5, 0.0, 1.0))
+                    angular_norm = float(np.clip(abs(float(action[1])), 0.0, 1.0))
+                    near_obstacle = max(0.0, 1.0 - self.min_obstacle_distance)
+                    reward += self.forward_reward_scale * linear_norm
+                    reward -= self.angular_penalty_scale * angular_norm
+                    reward -= self.obstacle_penalty_scale * near_obstacle
+
             self.last_overlap_ratio = self._compute_overlap_ratio()
             if self.last_overlap_ratio >= self.stuck_overlap_threshold:
-                reward -= 10.0
+                reward += self.stuck_penalty
                 done = True
                 reason = "stuck"
             elif self.episodic_memory_enabled:

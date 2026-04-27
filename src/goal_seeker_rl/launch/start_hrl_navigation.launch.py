@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, SetEnvironmentVariable
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, IncludeLaunchDescription, SetEnvironmentVariable
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration, PathJoinSubstitution
@@ -18,11 +20,14 @@ def generate_launch_description() -> LaunchDescription:
     use_rviz = LaunchConfiguration("use_rviz")
     use_joint_state_publisher = LaunchConfiguration("use_joint_state_publisher")
     world = LaunchConfiguration("world")
+    slam_params_file = LaunchConfiguration("slam_params_file")
     lookahead_distance = LaunchConfiguration("lookahead_distance")
     local_scan_samples = LaunchConfiguration("local_scan_samples")
     linear_speed_max = LaunchConfiguration("linear_speed_max")
     angular_speed_max = LaunchConfiguration("angular_speed_max")
     local_policy_source = LaunchConfiguration("local_policy_source")
+    local_model_dir = LaunchConfiguration("local_model_dir")
+    local_model_name = LaunchConfiguration("local_model_name")
     local_model_path = LaunchConfiguration("local_model_path")
     local_network_variant = LaunchConfiguration("local_network_variant")
     local_hidden_dim = LaunchConfiguration("local_hidden_dim")
@@ -61,11 +66,19 @@ def generate_launch_description() -> LaunchDescription:
     local_emergency_stop_distance = LaunchConfiguration("local_emergency_stop_distance")
     local_proactive_avoid_distance = LaunchConfiguration("local_proactive_avoid_distance")
 
+    default_workspace = os.environ.get("RL_BASE_WS", "/home/david/Desktop/laiting/rl_base_navigation")
+    default_model_dir = os.environ.get("RL_BASE_MODEL_DIR", os.path.join(default_workspace, "navigation_model"))
+    default_local_model_path = PathJoinSubstitution([local_model_dir, local_model_name])
     default_world = PathJoinSubstitution(
         [FindPackageShare("goal_seeker_rl"), "worlds", "goal_seeker_large_dynamic.world"]
     )
+    default_slam_params = PathJoinSubstitution(
+        [FindPackageShare("goal_seeker_rl"), "config", "slam_realsense_mapper.yaml"]
+    )
     robot_urdf = PathJoinSubstitution([FindPackageShare("goal_seeker_rl"), "urdf", "turtlebot3_waffle_minimal.urdf"])
+    local_gazebo_models = PathJoinSubstitution([FindPackageShare("goal_seeker_rl"), "models"])
     gazebo_models = PathJoinSubstitution([FindPackageShare("turtlebot3_gazebo"), "models"])
+    turtlebot_common_models = os.environ.get("TURTLEBOT3_COMMON_MODEL_PATH", "")
     gazebo_obstacle_plugins = PathJoinSubstitution(
         [
             FindPackageShare("turtlebot3_gazebo"),
@@ -77,7 +90,15 @@ def generate_launch_description() -> LaunchDescription:
     )
     set_gazebo_model_path = SetEnvironmentVariable(
         name="GAZEBO_MODEL_PATH",
-        value=[gazebo_models, ":", EnvironmentVariable("GAZEBO_MODEL_PATH", default_value="")],
+        value=[
+            local_gazebo_models,
+            ":",
+            gazebo_models,
+            ":",
+            turtlebot_common_models,
+            ":",
+            EnvironmentVariable("GAZEBO_MODEL_PATH", default_value=""),
+        ],
     )
     set_gazebo_plugin_path = SetEnvironmentVariable(
         name="GAZEBO_PLUGIN_PATH",
@@ -87,18 +108,16 @@ def generate_launch_description() -> LaunchDescription:
             EnvironmentVariable("GAZEBO_PLUGIN_PATH", default_value=""),
         ],
     )
+    set_gazebo_model_database_uri = SetEnvironmentVariable(name="GAZEBO_MODEL_DATABASE_URI", value="")
 
-    gzserver_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([FindPackageShare("gazebo_ros"), "launch", "gzserver.launch.py"])
-        ),
-        launch_arguments={"world": world}.items(),
+    gzserver_launch = ExecuteProcess(
+        cmd=["gzserver", "--verbose", "-s", "libgazebo_ros_init.so", "-s", "libgazebo_ros_factory.so", world],
+        output="screen",
     )
 
-    gzclient_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(
-            PathJoinSubstitution([FindPackageShare("gazebo_ros"), "launch", "gzclient.launch.py"])
-        ),
+    gzclient_launch = ExecuteProcess(
+        cmd=["gzclient"],
+        output="screen",
         condition=UnlessCondition(headless),
     )
 
@@ -124,7 +143,28 @@ def generate_launch_description() -> LaunchDescription:
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([FindPackageShare("slam_toolbox"), "launch", "online_async_launch.py"])
         ),
-        launch_arguments={"use_sim_time": use_sim_time}.items(),
+        launch_arguments={"use_sim_time": use_sim_time, "slam_params_file": slam_params_file}.items(),
+    )
+
+    depth_to_scan = Node(
+        package="depthimage_to_laserscan",
+        executable="depthimage_to_laserscan_node",
+        name="depthimage_to_laserscan",
+        output="screen",
+        parameters=[
+            {
+                "scan_time": 0.033,
+                "range_min": 0.12,
+                "range_max": 3.5,
+                "scan_height": 16,
+                "output_frame": "base_link",
+            }
+        ],
+        remappings=[
+            ("depth", "/camera/depth/image_raw"),
+            ("depth_camera_info", "/camera/depth/camera_info"),
+            ("scan", "/scan"),
+        ],
     )
 
     hrl_global_planner = Node(
@@ -234,6 +274,22 @@ def generate_launch_description() -> LaunchDescription:
                 "append_prev_action_to_state": local_append_prev_action,
                 "model_strict": False,
                 "policy_max_goal_distance": local_policy_max_goal_distance,
+                "publish_rl_path": True,
+                "rl_path_topic": "/rl_model_path",
+                "rl_path_frame": "base_link",
+                "rl_path_horizon_steps": 28,
+                "rl_path_dt_sec": 0.20,
+                "lookaround_enabled": True,
+                "lookaround_front_distance": 0.75,
+                "lookaround_clear_distance": 1.10,
+                "lookaround_turn_speed": 0.75,
+                "lookaround_duration_sec": 1.30,
+                "lookaround_min_duration_sec": 0.45,
+                "lookaround_cooldown_sec": 0.80,
+                "waiting_scan_creep_enabled": True,
+                "waiting_scan_creep_speed": 0.06,
+                "waiting_scan_turn_speed": 0.35,
+                "waiting_scan_front_clearance": 1.0,
             }
         ],
     )
@@ -255,15 +311,18 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("use_rviz", default_value="true"),
             DeclareLaunchArgument("use_joint_state_publisher", default_value="false"),
             DeclareLaunchArgument("world", default_value=default_world),
+            DeclareLaunchArgument("slam_params_file", default_value=default_slam_params),
             DeclareLaunchArgument("lookahead_distance", default_value="1.5"),
             DeclareLaunchArgument("local_scan_samples", default_value="40"),
             DeclareLaunchArgument("local_control_rate_hz", default_value="15.0"),
             DeclareLaunchArgument("linear_speed_max", default_value="0.20"),
             DeclareLaunchArgument("angular_speed_max", default_value="2.2"),
-            DeclareLaunchArgument("local_policy_source", default_value="reference_actor"),
+            DeclareLaunchArgument("local_policy_source", default_value="td3"),
+            DeclareLaunchArgument("local_model_dir", default_value=default_model_dir),
+            DeclareLaunchArgument("local_model_name", default_value="td3_latest.pth"),
             DeclareLaunchArgument(
                 "local_model_path",
-                default_value="/home/david/Desktop/laiting/rl_base_navigation/reference/turtlebot3_drlnav/src/turtlebot3_drl/model/examples/ddpg_0_stage9/actor_stage9_episode8000.pt",
+                default_value=default_local_model_path,
             ),
             DeclareLaunchArgument("local_network_variant", default_value="reference"),
             DeclareLaunchArgument("local_hidden_dim", default_value="512"),
@@ -302,10 +361,12 @@ def generate_launch_description() -> LaunchDescription:
             DeclareLaunchArgument("local_proactive_avoid_distance", default_value="0.85"),
             set_gazebo_model_path,
             set_gazebo_plugin_path,
+            set_gazebo_model_database_uri,
             gzserver_launch,
             gzclient_launch,
             robot_state_publisher,
             joint_state_publisher,
+            depth_to_scan,
             slam,
             hrl_global_planner,
             rl_local_driver,

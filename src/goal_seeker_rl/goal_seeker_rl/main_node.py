@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 import math
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -13,7 +14,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path as RosPath
 from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty
 import torch
@@ -87,6 +88,11 @@ class GoalSeekerMainNode(Node):
         self.goal_marker_topic = str(self.get_parameter("goal_marker_topic").value)
         self.goal_marker_frame = str(self.get_parameter("goal_marker_frame").value)
         self.publish_goal_marker = bool(self.get_parameter("publish_goal_marker").value)
+        self.publish_rl_path = bool(self.get_parameter("publish_rl_path").value)
+        self.rl_path_topic = str(self.get_parameter("rl_path_topic").value)
+        self.rl_path_frame = str(self.get_parameter("rl_path_frame").value)
+        self.rl_path_horizon_steps = int(self.get_parameter("rl_path_horizon_steps").value)
+        self.rl_path_dt_sec = float(self.get_parameter("rl_path_dt_sec").value)
         self.tensorboard_enabled = bool(self.get_parameter("tensorboard_enabled").value)
         self.tensorboard_log_dir = str(self.get_parameter("tensorboard_log_dir").value)
         self.tensorboard_flush_secs = int(self.get_parameter("tensorboard_flush_secs").value)
@@ -96,6 +102,25 @@ class GoalSeekerMainNode(Node):
         self.escape_linear_cap = float(self.get_parameter("escape_linear_cap").value)
         self.escape_min_turn = float(self.get_parameter("escape_min_turn").value)
         self.escape_overlap_gate = float(self.get_parameter("escape_overlap_gate").value)
+        self.safety_override_enabled = bool(self.get_parameter("safety_override_enabled").value)
+        self.safety_front_stop_distance = float(self.get_parameter("safety_front_stop_distance").value)
+        self.safety_front_slow_distance = float(self.get_parameter("safety_front_slow_distance").value)
+        self.safety_front_angle_deg = float(self.get_parameter("safety_front_angle_deg").value)
+        self.safety_side_stop_distance = float(self.get_parameter("safety_side_stop_distance").value)
+        self.safety_turn_min = float(self.get_parameter("safety_turn_min").value)
+        self.safety_side_linear_cap = float(self.get_parameter("safety_side_linear_cap").value)
+        self.rl_path_obstacle_margin = float(self.get_parameter("rl_path_obstacle_margin").value)
+        self.rl_path_clearance_angle_window_deg = float(self.get_parameter("rl_path_clearance_angle_window_deg").value)
+        self.goal_stop_distance = float(self.get_parameter("goal_stop_distance").value)
+        self.goal_slow_distance = float(self.get_parameter("goal_slow_distance").value)
+        self.lookaround_enabled = bool(self.get_parameter("lookaround_enabled").value)
+        self.lookaround_front_distance = float(self.get_parameter("lookaround_front_distance").value)
+        self.lookaround_clear_distance = float(self.get_parameter("lookaround_clear_distance").value)
+        self.lookaround_front_angle_deg = float(self.get_parameter("lookaround_front_angle_deg").value)
+        self.lookaround_turn_speed = float(self.get_parameter("lookaround_turn_speed").value)
+        self.lookaround_duration_sec = float(self.get_parameter("lookaround_duration_sec").value)
+        self.lookaround_min_duration_sec = float(self.get_parameter("lookaround_min_duration_sec").value)
+        self.lookaround_cooldown_sec = float(self.get_parameter("lookaround_cooldown_sec").value)
         self.hybrid_exploration_enabled = bool(self.get_parameter("hybrid_exploration_enabled").value)
         self.hybrid_revisit_trigger = float(self.get_parameter("hybrid_revisit_trigger").value)
         self.hybrid_progress_window_sec = float(self.get_parameter("hybrid_progress_window_sec").value)
@@ -146,6 +171,14 @@ class GoalSeekerMainNode(Node):
             dead_end_side_min_angle_deg=float(self.get_parameter("dead_end_side_min_angle_deg").value),
             dead_end_side_max_angle_deg=float(self.get_parameter("dead_end_side_max_angle_deg").value),
             dead_end_revisit_gate=float(self.get_parameter("dead_end_revisit_gate").value),
+            goal_reward=float(self.get_parameter("goal_reward").value),
+            collision_penalty=float(self.get_parameter("collision_penalty").value),
+            stuck_penalty=float(self.get_parameter("stuck_penalty").value),
+            progress_reward_scale=float(self.get_parameter("progress_reward_scale").value),
+            forward_reward_scale=float(self.get_parameter("forward_reward_scale").value),
+            angular_penalty_scale=float(self.get_parameter("angular_penalty_scale").value),
+            obstacle_penalty_scale=float(self.get_parameter("obstacle_penalty_scale").value),
+            time_penalty=float(self.get_parameter("time_penalty").value),
         )
         self.append_prev_action_to_state = self.append_prev_action_to_state and (not self.use_reference_policy)
         self.policy_state_dim = self.environment.state_dim + (2 if self.append_prev_action_to_state else 0)
@@ -221,6 +254,9 @@ class GoalSeekerMainNode(Node):
         self.goal_marker_pub = (
             self.create_publisher(Marker, self.goal_marker_topic, 1) if self.publish_goal_marker else None
         )
+        self.rl_path_pub = (
+            self.create_publisher(RosPath, self.rl_path_topic, 1) if self.publish_rl_path else None
+        )
 
         self.reset_client = None
         if self.reset_service_name:
@@ -238,6 +274,12 @@ class GoalSeekerMainNode(Node):
         self.last_replan_sec = -1e9
         self.progress_history: deque[tuple[float, float]] = deque()
         self.recent_subgoals: deque[tuple[float, float]] = deque(maxlen=12)
+        self._last_safety_log_sec = -1e9
+        self.lookaround_until_sec = -1e9
+        self.lookaround_started_sec = -1e9
+        self.lookaround_cooldown_until_sec = -1e9
+        self.lookaround_turn_sign = 1.0
+        self._last_lookaround_log_sec = -1e9
 
         self.total_steps = 0
         self.episode_index = 0
@@ -260,13 +302,24 @@ class GoalSeekerMainNode(Node):
 
     def _declare_parameters(self) -> None:
         """Declare ROS parameters used by the main node."""
+        default_workspace = os.environ.get("RL_BASE_WS", "/home/david/Desktop/laiting/rl_base_navigation")
+        default_model_dir = os.environ.get("RL_BASE_MODEL_DIR", os.path.join(default_workspace, "navigation_model"))
+        default_reference_actor = os.path.join(
+            default_workspace,
+            "reference",
+            "turtlebot3_drlnav",
+            "src",
+            "turtlebot3_drl",
+            "model",
+            "examples",
+            "ddpg_0_stage9",
+            "actor_stage9_episode8000.pt",
+        )
+
         self.declare_parameter("inference_mode", False)
         self.declare_parameter("policy_source", "td3")
         self.declare_parameter("model_path", "")
-        self.declare_parameter(
-            "reference_actor_path",
-            "/home/david/Desktop/laiting/rl_base_navigation/reference/turtlebot3_drlnav/src/turtlebot3_drl/model/examples/ddpg_0_stage9/actor_stage9_episode8000.pt",
-        )
+        self.declare_parameter("reference_actor_path", default_reference_actor)
         self.declare_parameter("reference_state_scan_samples", 40)
         self.declare_parameter("reference_hidden_dim", 512)
         self.declare_parameter("state_scan_samples", 24)
@@ -288,10 +341,18 @@ class GoalSeekerMainNode(Node):
         self.declare_parameter("lidar_max_range", 3.5)
         self.declare_parameter("max_goal_distance", 5.94)
         self.declare_parameter("goal_tolerance", 0.20)
-        self.declare_parameter("collision_distance", 0.13)
+        self.declare_parameter("collision_distance", 0.30)
         self.declare_parameter("stuck_cell_size", 0.10)
         self.declare_parameter("stuck_overlap_threshold", 0.70)
         self.declare_parameter("stuck_min_displacement", 0.50)
+        self.declare_parameter("goal_reward", 100.0)
+        self.declare_parameter("collision_penalty", -100.0)
+        self.declare_parameter("stuck_penalty", -30.0)
+        self.declare_parameter("progress_reward_scale", 10.0)
+        self.declare_parameter("forward_reward_scale", 0.5)
+        self.declare_parameter("angular_penalty_scale", 0.5)
+        self.declare_parameter("obstacle_penalty_scale", 0.5)
+        self.declare_parameter("time_penalty", 0.01)
         self.declare_parameter("episodic_memory_enabled", True)
         self.declare_parameter("memory_cell_size", 0.20)
         self.declare_parameter("memory_novelty_reward", 0.40)
@@ -314,6 +375,25 @@ class GoalSeekerMainNode(Node):
         self.declare_parameter("escape_linear_cap", 0.05)
         self.declare_parameter("escape_min_turn", 0.60)
         self.declare_parameter("escape_overlap_gate", 0.55)
+        self.declare_parameter("safety_override_enabled", True)
+        self.declare_parameter("safety_front_stop_distance", 0.42)
+        self.declare_parameter("safety_front_slow_distance", 0.95)
+        self.declare_parameter("safety_front_angle_deg", 28.0)
+        self.declare_parameter("safety_side_stop_distance", 0.34)
+        self.declare_parameter("safety_turn_min", 0.62)
+        self.declare_parameter("safety_side_linear_cap", 0.04)
+        self.declare_parameter("rl_path_obstacle_margin", 0.42)
+        self.declare_parameter("rl_path_clearance_angle_window_deg", 8.0)
+        self.declare_parameter("goal_stop_distance", 0.38)
+        self.declare_parameter("goal_slow_distance", 0.85)
+        self.declare_parameter("lookaround_enabled", True)
+        self.declare_parameter("lookaround_front_distance", 0.75)
+        self.declare_parameter("lookaround_clear_distance", 1.10)
+        self.declare_parameter("lookaround_front_angle_deg", 34.0)
+        self.declare_parameter("lookaround_turn_speed", 0.55)
+        self.declare_parameter("lookaround_duration_sec", 1.35)
+        self.declare_parameter("lookaround_min_duration_sec", 0.45)
+        self.declare_parameter("lookaround_cooldown_sec", 0.80)
         self.declare_parameter("hybrid_exploration_enabled", True)
         self.declare_parameter("hybrid_revisit_trigger", 0.35)
         self.declare_parameter("hybrid_progress_window_sec", 12.0)
@@ -343,7 +423,7 @@ class GoalSeekerMainNode(Node):
         self.declare_parameter("exploration_std", 0.1)
         self.declare_parameter("warmup_steps", 2000)
 
-        self.declare_parameter("checkpoint_dir", "checkpoints")
+        self.declare_parameter("checkpoint_dir", default_model_dir)
         self.declare_parameter("checkpoint_interval_steps", 5000)
         self.declare_parameter("reset_on_episode_end", True)
         self.declare_parameter("auto_goal_training", False)
@@ -357,11 +437,13 @@ class GoalSeekerMainNode(Node):
         self.declare_parameter("goal_marker_topic", "/goal_marker")
         self.declare_parameter("goal_marker_frame", "odom")
         self.declare_parameter("publish_goal_marker", True)
+        self.declare_parameter("publish_rl_path", True)
+        self.declare_parameter("rl_path_topic", "/rl_model_path")
+        self.declare_parameter("rl_path_frame", "odom")
+        self.declare_parameter("rl_path_horizon_steps", 30)
+        self.declare_parameter("rl_path_dt_sec", 0.20)
         self.declare_parameter("tensorboard_enabled", True)
-        self.declare_parameter(
-            "tensorboard_log_dir",
-            "/home/david/Desktop/laiting/rl_base_navigation/src/goal_seeker_rl/model/tb",
-        )
+        self.declare_parameter("tensorboard_log_dir", os.path.join(default_model_dir, "tb"))
         self.declare_parameter("tensorboard_flush_secs", 5)
         self.declare_parameter("success_window_size", 20)
 
@@ -400,21 +482,21 @@ class GoalSeekerMainNode(Node):
             ):
                 self._set_auto_goal(now_sec)
             else:
+                self._publish_stop()  # 明確停止，避免亂跑
                 return
 
         if not self.environment.ready_for_control():
+            self._publish_stop()
             return
 
-        result = self.environment.evaluate_step(now_sec)
+        result = self.environment.evaluate_step(now_sec, previous_action=self.last_action)
         policy_state = self._compose_policy_state(result.state)
         if self.inference_mode and not self.inference_reset_on_stuck and result.reason == "stuck":
-            # Keep trying in inference instead of stopping too early.
             result.done = False
             result.reason = "running"
         if self._handle_hybrid_navigation(now_sec, result):
             return
 
-        # The result at tick t is treated as outcome of action from tick t-1.
         if self.last_state is not None and self.last_action is not None:
             self._consume_transition(result, policy_state)
 
@@ -423,11 +505,19 @@ class GoalSeekerMainNode(Node):
             reason = result.reason if result.done else "timeout"
             self._finish_episode(reason, result)
             return
+        if self.environment.goal_xy is not None and result.goal_distance <= self.goal_stop_distance:
+            result.done = True
+            result.reason = "goal"
+            self._finish_episode("goal", result)
+            return
+        if self._publish_lookaround_if_needed(now_sec, result):
+            return
 
         action_norm = self._select_action(policy_state)
-        self._publish_action(action_norm)
+        self._publish_rl_model_path(action_norm)
+        executed_action_norm = self._publish_action(action_norm)
         self.last_state = policy_state
-        self.last_action = action_norm
+        self.last_action = executed_action_norm
 
     def _consume_transition(self, result: StepResult, next_policy_state: np.ndarray) -> None:
         """Store transition and optionally train the TD3 model."""
@@ -481,7 +571,10 @@ class GoalSeekerMainNode(Node):
 
         stagnating, progress_delta = self._is_progress_stagnating()
         revisit_high = self.environment.last_revisit_ratio >= self.hybrid_revisit_trigger
-        if not (stagnating or revisit_high):
+        # 強化轉圈偵測：檢查角速度異常
+        is_spinning = abs(self.environment.angular_velocity_z) > 1.5 and self.environment.min_obstacle_distance > 0.5
+        
+        if not (stagnating or revisit_high or is_spinning):
             return False
 
         candidate = self._sample_exploration_subgoal()
@@ -490,12 +583,11 @@ class GoalSeekerMainNode(Node):
 
         gx, gy, score = candidate
         self.last_replan_sec = now_sec
-        self._activate_goal(gx, gy, now_sec, source="hybrid subgoal", reset_episode=False, is_subgoal=True)
+        self._activate_goal(gx, gy, now_sec, source="hybrid subgoal escape", reset_episode=False, is_subgoal=True)
         self.get_logger().info(
-            "Hybrid exploration subgoal | "
-            f"x={gx:.2f} y={gy:.2f} score={score:.3f} "
-            f"final_dist={final_distance:.3f} progress_delta={progress_delta:.3f} "
-            f"revisit={self.environment.last_revisit_ratio:.2f}"
+            "Hybrid exploration triggered | "
+            f"x={gx:.2f} y={gy:.2f} score={score:.3f} stagnating={stagnating} "
+            f"revisit={self.environment.last_revisit_ratio:.2f} spinning={is_spinning}"
         )
         return True
 
@@ -686,22 +778,217 @@ class GoalSeekerMainNode(Node):
             return state
         return np.concatenate([state.astype(np.float32), self.prev_action_norm], axis=0)
 
-    def _publish_action(self, action_norm: np.ndarray) -> None:
+    def _publish_rl_model_path(self, initial_action: np.ndarray) -> None:
+        """Publish a short open-loop rollout of the current RL policy for RViz."""
+        if self.rl_path_pub is None or self.environment.goal_xy is None:
+            return
+
+        steps = max(1, self.rl_path_horizon_steps)
+        dt = max(0.02, self.rl_path_dt_sec)
+        x = float(self.environment.robot_x)
+        y = float(self.environment.robot_y)
+        yaw = float(self.environment.robot_yaw)
+        prev_action = np.asarray(initial_action, dtype=np.float32)
+
+        msg = RosPath()
+        msg.header.frame_id = self.rl_path_frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.poses.append(self._make_path_pose(x, y, yaw, msg.header.frame_id, msg.header.stamp))
+
+        for _ in range(steps):
+            if self.environment.goal_xy is not None:
+                if math.hypot(self.environment.goal_xy[0] - x, self.environment.goal_xy[1] - y) <= self.goal_stop_distance:
+                    break
+            base_state = self._rollout_state(x, y, yaw)
+            action = self._predict_rollout_action(base_state, prev_action)
+            linear_cap = self.reference_linear_speed_max if self.use_reference_policy else self.linear_speed_max
+            angular_cap = self.reference_angular_speed_max if self.use_reference_policy else self.angular_speed_max
+            linear_x, angular_z = self._action_to_velocity(action, linear_cap, angular_cap)
+            linear_x, angular_z = self._apply_goal_arrival_behavior(linear_x, angular_z)
+            linear_x, angular_z, _ = self._apply_realsense_safety(linear_x, angular_z, angular_cap, log=False)
+            next_x = x + linear_x * math.cos(yaw) * dt
+            next_y = y + linear_x * math.sin(yaw) * dt
+            next_yaw = self._wrap_angle(yaw + angular_z * dt)
+            if not self._rollout_point_has_scan_clearance(next_x, next_y):
+                break
+            x = next_x
+            y = next_y
+            yaw = next_yaw
+            msg.poses.append(self._make_path_pose(x, y, yaw, msg.header.frame_id, msg.header.stamp))
+            prev_action = self._velocity_to_action_norm(linear_x, angular_z, linear_cap, angular_cap)
+
+        self.rl_path_pub.publish(msg)
+
+    def _rollout_state(self, x: float, y: float, yaw: float) -> np.ndarray:
+        """Build a policy state for a simulated pose using the latest scan."""
+        if self.environment.goal_xy is None:
+            distance = self.environment.max_goal_distance
+            heading = 0.0
+        else:
+            dx = self.environment.goal_xy[0] - x
+            dy = self.environment.goal_xy[1] - y
+            distance = math.hypot(dx, dy)
+            heading = self._wrap_angle(math.atan2(dy, dx) - yaw)
+        distance_norm = float(np.clip(distance / self.environment.max_goal_distance, 0.0, 1.0))
+        heading_norm = float(np.clip(heading / math.pi, -1.0, 1.0))
+        return np.concatenate(
+            [
+                self.environment.scan_norm.astype(np.float32),
+                np.array([distance_norm, heading_norm], dtype=np.float32),
+            ]
+        )
+
+    def _predict_rollout_action(self, base_state: np.ndarray, prev_action: np.ndarray) -> np.ndarray:
+        """Run the current policy without exploration for path visualization."""
+        if self.use_reference_policy:
+            if self.reference_policy is None:
+                return prev_action
+            policy_input = np.concatenate([base_state.astype(np.float32), prev_action.astype(np.float32)], axis=0)
+            with torch.no_grad():
+                state_t = torch.as_tensor(
+                    policy_input,
+                    dtype=torch.float32,
+                    device=next(self.reference_policy.parameters()).device,
+                )
+                action = self.reference_policy(state_t.unsqueeze(0)).cpu().numpy()[0]
+            return np.clip(action, -1.0, 1.0).astype(np.float32)
+
+        if self.agent is None:
+            return prev_action
+        policy_state = base_state
+        if self.append_prev_action_to_state:
+            policy_state = np.concatenate([base_state.astype(np.float32), prev_action.astype(np.float32)], axis=0)
+        return self.agent.select_action(policy_state, explore=False)
+
+    def _make_path_pose(self, x: float, y: float, yaw: float, frame_id: str, stamp) -> PoseStamped:
+        """Create one stamped pose for the RViz rollout path."""
+        pose = PoseStamped()
+        pose.header.frame_id = frame_id
+        pose.header.stamp = stamp
+        pose.pose.position.x = x
+        pose.pose.position.y = y
+        pose.pose.position.z = 0.02
+        pose.pose.orientation.z = math.sin(0.5 * yaw)
+        pose.pose.orientation.w = math.cos(0.5 * yaw)
+        return pose
+
+    def _publish_action(self, action_norm: np.ndarray) -> np.ndarray:
         """Map normalized action to robot velocity command and publish."""
         action = np.clip(action_norm, -1.0, 1.0)
         linear_cap = self.reference_linear_speed_max if self.use_reference_policy else self.linear_speed_max
         angular_cap = self.reference_angular_speed_max if self.use_reference_policy else self.angular_speed_max
-        linear_x = float((action[0] + 1.0) * 0.5 * linear_cap)
-        angular_z = float(np.clip(action[1] * angular_cap, -angular_cap, angular_cap))
+        linear_x, angular_z = self._action_to_velocity(action, linear_cap, angular_cap)
+        linear_x, angular_z = self._apply_goal_arrival_behavior(linear_x, angular_z)
         linear_x, angular_z = self._apply_escape_override(linear_x, angular_z, angular_cap)
+        linear_x, angular_z, _ = self._apply_realsense_safety(linear_x, angular_z, angular_cap)
 
         twist = Twist()
         twist.linear.x = linear_x
         twist.angular.z = angular_z
         self.cmd_pub.publish(twist)
+        self.prev_action_norm = self._velocity_to_action_norm(linear_x, angular_z, linear_cap, angular_cap)
+        return self.prev_action_norm.copy()
+
+    def _action_to_velocity(
+        self,
+        action_norm: np.ndarray,
+        linear_cap: float,
+        angular_cap: float,
+    ) -> tuple[float, float]:
+        """Convert policy action in [-1, 1] to velocity limits."""
+        action = np.clip(action_norm, -1.0, 1.0)
+        linear_x = float((action[0] + 1.0) * 0.5 * linear_cap)
+        angular_z = float(np.clip(action[1] * angular_cap, -angular_cap, angular_cap))
+        return linear_x, angular_z
+
+    def _velocity_to_action_norm(
+        self,
+        linear_x: float,
+        angular_z: float,
+        linear_cap: float,
+        angular_cap: float,
+    ) -> np.ndarray:
+        """Convert the final commanded velocity back into normalized policy action space."""
         linear_norm = float(np.clip((linear_x / max(1e-6, linear_cap)) * 2.0 - 1.0, -1.0, 1.0))
         angular_norm = float(np.clip(angular_z / max(1e-6, angular_cap), -1.0, 1.0))
-        self.prev_action_norm = np.array([linear_norm, angular_norm], dtype=np.float32)
+        return np.array([linear_norm, angular_norm], dtype=np.float32)
+
+    def _apply_goal_arrival_behavior(self, linear_x: float, angular_z: float) -> tuple[float, float]:
+        """Slow down near the active goal and lock stop inside the final tolerance."""
+        if self.environment.goal_xy is None:
+            return linear_x, angular_z
+
+        goal_dist = self._distance_to_point(*self.environment.goal_xy)
+        if goal_dist <= self.goal_stop_distance:
+            return 0.0, 0.0
+        if goal_dist >= self.goal_slow_distance:
+            return linear_x, angular_z
+
+        scale = float(
+            np.clip(
+                (goal_dist - self.goal_stop_distance) / max(0.05, self.goal_slow_distance - self.goal_stop_distance),
+                0.0,
+                1.0,
+            )
+        )
+        linear_x = min(linear_x, max(0.02, linear_x * scale))
+        angular_z *= max(0.35, scale)
+        return linear_x, angular_z
+
+    def _publish_lookaround_if_needed(self, now_sec: float, result: StepResult) -> bool:
+        """Rotate in place briefly to gather Realsense context when the forward view is blocked."""
+        if not self.lookaround_enabled or not self.environment.has_scan:
+            return False
+        if result.goal_distance <= self.goal_slow_distance:
+            return False
+
+        front_angle = math.radians(max(1.0, self.lookaround_front_angle_deg))
+        front_clear = self._scan_sector_clearance(-front_angle, front_angle, percentile=20.0)
+        still_active = now_sec < self.lookaround_until_sec
+        active_elapsed = now_sec - self.lookaround_started_sec
+        clear_enough = front_clear >= self.lookaround_clear_distance
+
+        if still_active:
+            if clear_enough and active_elapsed >= self.lookaround_min_duration_sec:
+                self.lookaround_until_sec = -1e9
+                self.lookaround_cooldown_until_sec = now_sec + self.lookaround_cooldown_sec
+                return False
+            self._publish_lookaround_turn(now_sec, front_clear)
+            return True
+
+        if now_sec < self.lookaround_cooldown_until_sec:
+            return False
+        if front_clear >= self.lookaround_front_distance:
+            return False
+
+        left_clear = self._scan_sector_clearance(math.radians(10.0), math.radians(70.0), percentile=35.0)
+        right_clear = self._scan_sector_clearance(math.radians(-70.0), math.radians(-10.0), percentile=35.0)
+        if abs(left_clear - right_clear) > 0.05:
+            self.lookaround_turn_sign = 1.0 if left_clear >= right_clear else -1.0
+        elif abs(self.prev_action_norm[1]) > 0.05:
+            self.lookaround_turn_sign = 1.0 if self.prev_action_norm[1] >= 0.0 else -1.0
+        else:
+            self.lookaround_turn_sign *= -1.0
+
+        self.lookaround_started_sec = now_sec
+        self.lookaround_until_sec = now_sec + self.lookaround_duration_sec
+        self._publish_lookaround_turn(now_sec, front_clear)
+        return True
+
+    def _publish_lookaround_turn(self, now_sec: float, front_clear: float) -> None:
+        """Publish an in-place scan turn and remember it as the executed action."""
+        angular_cap = self.reference_angular_speed_max if self.use_reference_policy else self.angular_speed_max
+        angular_z = float(np.clip(self.lookaround_turn_sign * self.lookaround_turn_speed, -angular_cap, angular_cap))
+        twist = Twist()
+        twist.angular.z = angular_z
+        self.cmd_pub.publish(twist)
+        self.prev_action_norm = self._velocity_to_action_norm(0.0, angular_z, self.linear_speed_max, angular_cap)
+        self.last_action = self.prev_action_norm.copy()
+        if (now_sec - self._last_lookaround_log_sec) >= 1.0:
+            self._last_lookaround_log_sec = now_sec
+            self.get_logger().info(
+                f"Realsense look-around scan | front={front_clear:.2f} turn={angular_z:.2f}"
+            )
 
     def _apply_escape_override(self, linear_x: float, angular_z: float, angular_cap: float) -> tuple[float, float]:
         """Bias action away from repeated dead-end behavior using episodic memory cues."""
@@ -725,8 +1012,110 @@ class GoalSeekerMainNode(Node):
         linear_x = float(min(linear_x, self.escape_linear_cap))
         return linear_x, angular_z
 
+    def _apply_realsense_safety(
+        self,
+        linear_x: float,
+        angular_z: float,
+        angular_cap: float,
+        log: bool = True,
+    ) -> tuple[float, float, bool]:
+        """Clamp the RL command when the Realsense-derived scan sees a near obstacle."""
+        if not self.safety_override_enabled or not self.environment.has_scan:
+            return linear_x, angular_z, False
+
+        front_angle = math.radians(max(1.0, self.safety_front_angle_deg))
+        front_clear = self._scan_sector_clearance(-front_angle, front_angle, percentile=12.0)
+        left_clear = self._scan_sector_clearance(math.radians(25.0), math.radians(120.0), percentile=25.0)
+        right_clear = self._scan_sector_clearance(math.radians(-120.0), math.radians(-25.0), percentile=25.0)
+        stop_distance = max(self.environment.collision_distance, self.safety_front_stop_distance)
+        slow_distance = max(stop_distance + 0.05, self.safety_front_slow_distance)
+        turn_sign = 1.0 if left_clear >= right_clear else -1.0
+        min_turn = max(0.0, min(1.0, self.safety_turn_min)) * angular_cap
+        safety_active = False
+
+        if front_clear <= stop_distance:
+            linear_x = 0.0
+            angular_z = turn_sign * max(abs(angular_z), min_turn)
+            safety_active = True
+        elif front_clear <= slow_distance and linear_x > 0.0:
+            scale = float(np.clip((front_clear - stop_distance) / (slow_distance - stop_distance), 0.0, 1.0))
+            linear_x *= scale
+            angular_z += turn_sign * (1.0 - scale) * min_turn
+            safety_active = True
+
+        if left_clear <= self.safety_side_stop_distance and left_clear < right_clear:
+            linear_x = min(linear_x, self.safety_side_linear_cap)
+            angular_z = min(angular_z, -min_turn)
+            safety_active = True
+        elif right_clear <= self.safety_side_stop_distance and right_clear < left_clear:
+            linear_x = min(linear_x, self.safety_side_linear_cap)
+            angular_z = max(angular_z, min_turn)
+            safety_active = True
+
+        angular_z = float(np.clip(angular_z, -angular_cap, angular_cap))
+        if safety_active and log:
+            now_sec = self._now_sec()
+            if (now_sec - self._last_safety_log_sec) >= 1.0:
+                self._last_safety_log_sec = now_sec
+                self.get_logger().warn(
+                    "Realsense safety override | "
+                    f"front={front_clear:.2f} left={left_clear:.2f} right={right_clear:.2f} "
+                    f"cmd=({linear_x:.2f}, {angular_z:.2f})"
+                )
+        return linear_x, angular_z, safety_active
+
+    def _scan_sector_clearance(self, min_angle: float, max_angle: float, percentile: float) -> float:
+        """Return a robust clearance estimate inside a scan angular sector."""
+        ranges = np.asarray(self.environment.scan_sampled, dtype=np.float32)
+        angles = np.asarray(self.environment.scan_angles, dtype=np.float32)
+        if ranges.size == 0 or ranges.size != angles.size:
+            return self.environment.lidar_max_range
+
+        mask = (angles >= min_angle) & (angles <= max_angle)
+        if not np.any(mask):
+            return self.environment.lidar_max_range
+
+        values = ranges[mask]
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return self.environment.lidar_max_range
+        return float(np.percentile(values, float(np.clip(percentile, 0.0, 100.0))))
+
+    def _scan_clearance_at_angle(self, rel_angle: float) -> float:
+        """Estimate how far the current scan is clear near a relative angle."""
+        ranges = np.asarray(self.environment.scan_sampled, dtype=np.float32)
+        angles = np.asarray(self.environment.scan_angles, dtype=np.float32)
+        if ranges.size == 0 or ranges.size != angles.size:
+            return self.environment.lidar_max_range
+
+        angle_window = math.radians(max(1.0, self.rl_path_clearance_angle_window_deg))
+        diff = np.abs(np.arctan2(np.sin(angles - rel_angle), np.cos(angles - rel_angle)))
+        mask = diff <= angle_window
+        if not np.any(mask):
+            idx = int(np.argmin(diff))
+            return float(ranges[idx])
+
+        values = ranges[mask]
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return self.environment.lidar_max_range
+        return float(np.percentile(values, 20.0))
+
+    def _rollout_point_has_scan_clearance(self, x: float, y: float) -> bool:
+        """Return whether a rollout point is still before the scan obstacle in that direction."""
+        dx = x - self.environment.robot_x
+        dy = y - self.environment.robot_y
+        distance = math.hypot(dx, dy)
+        if distance <= 0.02:
+            return True
+
+        rel_angle = self._wrap_angle(math.atan2(dy, dx) - self.environment.robot_yaw)
+        clearance = self._scan_clearance_at_angle(rel_angle)
+        return (distance + self.rl_path_obstacle_margin) <= clearance
+
     def _publish_stop(self) -> None:
         """Publish zero velocity command."""
+        self.prev_action_norm[:] = 0.0
         self.cmd_pub.publish(Twist())
 
     def _reset_simulation(self) -> None:

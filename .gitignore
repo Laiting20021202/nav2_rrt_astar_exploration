@@ -1,10 +1,19 @@
 build/
 install/
 log/
+.venv/
 reference/
 robot model/
 src/goal_seeker_rl/model/*.pth
 src/goal_seeker_rl/model/*.pt
 src/goal_seeker_rl/model/tb/
+navigation_model/*.pth
+navigation_model/*.pt
+navigation_model/tb/
+navigation_model/**/*.pth
+navigation_model/**/*.pt
+navigation_model/**/tb/
+maps/*.pgm
+maps/*.yaml
 **/__pycache__/
 *.pyc

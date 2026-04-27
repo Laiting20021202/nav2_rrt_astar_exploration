@@ -1,0 +1,14 @@
+.git
+.venv
+build
+install
+log
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.mypy_cache
+*.bag
+*.db3
+*.mcap
+maps/*.pgm
+maps/*.yaml
